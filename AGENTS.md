@@ -53,5 +53,13 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 3. Each feature, bugfix, refactor or any other change purpose must be created on apropriate new branch (not master), the branch follows naming convention alike conventional commits specification: <CHANGE_TYPE>/<WHATS CHANGED>.
 4. The agent uses git only for creating commits, branches and switching between them. Any other action is strictly forbidden.
 
-## !! WARNING !!
+# Reliability rules
+## Api
+1. All api endpoints must be reliable (error resistant). Endpoits which must be idempotent (e.g. creating reservation) must implement idempotency using idempotency key.
+2. Api endpoit which executes multiple write operations must use transactions.
+3. Api endpoits are protected by sliding window rate limiting by ip.
+## Web
+1. Any api calls made from the web client must retry 3 times if connection is broken or response dosent arrive after timespan of 5 seconds. If endpoint call is to be idempotent idempotency key is sent inside the request.
+
+# !! WARNING !!
 Before changing anything related to: Contract (adding, removing endpoits ect.) and Techstack (adding, removing, chaneging dependency solutions), ask user for permission, then make apropriate changes in "AGENTS.md" file.
