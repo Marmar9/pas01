@@ -1,78 +1,81 @@
-import { beforeEach, describe, expect, test } from "bun:test";
-import {
-  checkRateLimit,
-  getClientIp,
-  RATE_LIMITS,
-  resetRateLimitStore,
-} from "@/lib/rate-limit";
+import { afterEach, describe, expect, test } from "bun:test";
+import { MemoryStore } from "@universal-rate-limit/nextjs";
+import { RATE_LIMITS, rateLimited } from "@/lib/rate-limit";
 
-beforeEach(() => {
-  resetRateLimitStore();
-});
+const stores: MemoryStore[] = [];
 
-describe("checkRateLimit", () => {
-  test("allows requests up to the limit and rejects the next one", () => {
-    const policy = { limit: 3, windowMs: 1_000 };
-    const now = 1_000_000;
+function createLimiter(limit: number) {
+  const store = new MemoryStore();
 
-    expect(checkRateLimit("ip-a", policy, now).allowed).toBe(true);
-    expect(checkRateLimit("ip-a", policy, now + 10).allowed).toBe(true);
-    const last = checkRateLimit("ip-a", policy, now + 20);
+  stores.push(store);
 
-    expect(last.allowed).toBe(true);
-    expect(last.remaining).toBe(0);
-
-    const denied = checkRateLimit("ip-a", policy, now + 30);
-
-    expect(denied.allowed).toBe(false);
-    expect(denied.remaining).toBe(0);
-    expect(denied.retryAfterSeconds).toBeGreaterThan(0);
+  return rateLimited(async () => Response.json({ ok: true }), {
+    limit,
+    store,
+    algorithm: { type: "sliding-window", windowMs: 60_000 },
+    prefix: "test",
   });
+}
 
-  test("slides the window as old requests expire", () => {
-    const policy = { limit: 2, windowMs: 1_000 };
-    const now = 1_000_000;
-
-    checkRateLimit("ip-b", policy, now);
-    checkRateLimit("ip-b", policy, now + 100);
-
-    expect(checkRateLimit("ip-b", policy, now + 200).allowed).toBe(false);
-    expect(checkRateLimit("ip-b", policy, now + 1_001).allowed).toBe(true);
+function requestWithIp(ip: string): Request {
+  return new Request("http://localhost/api/events", {
+    headers: { "x-forwarded-for": ip },
   });
+}
 
-  test("keeps buckets isolated per key", () => {
-    const policy = { limit: 1, windowMs: 1_000 };
-
-    expect(checkRateLimit("ip-c", policy, 1_000).allowed).toBe(true);
-    expect(checkRateLimit("ip-c", policy, 1_001).allowed).toBe(false);
-    expect(checkRateLimit("ip-d", policy, 1_001).allowed).toBe(true);
-  });
-
-  test("exposes production policies", () => {
-    expect(RATE_LIMITS.events.limit).toBeGreaterThan(0);
-    expect(RATE_LIMITS.event.limit).toBeGreaterThan(0);
-    expect(RATE_LIMITS.reservations.limit).toBeGreaterThan(0);
-  });
-});
-
-describe("getClientIp", () => {
-  function requestWith(headers: Record<string, string>): Request {
-    return new Request("http://localhost/api/events", { headers });
+afterEach(() => {
+  for (const store of stores) {
+    store.shutdown();
   }
 
-  test("uses the first forwarded address", () => {
-    expect(
-      getClientIp(requestWith({ "x-forwarded-for": "203.0.113.7, 10.0.0.1" })),
-    ).toBe("203.0.113.7");
+  stores.length = 0;
+});
+
+describe("rateLimited", () => {
+  test("allows requests up to the limit and returns a JSON 429 afterwards", async () => {
+    const limiter = createLimiter(2);
+    const request = requestWithIp("203.0.113.7");
+
+    expect((await limiter(request)).status).toBe(200);
+    expect((await limiter(request)).status).toBe(200);
+
+    const denied = await limiter(request);
+
+    expect(denied.status).toBe(429);
+    expect(denied.headers.get("retry-after")).toBeTruthy();
+    expect(await denied.json()).toEqual({
+      error: "Too many requests. Try again later.",
+      code: "RATE_LIMITED",
+    });
   });
 
-  test("falls back to x-real-ip", () => {
-    expect(getClientIp(requestWith({ "x-real-ip": "198.51.100.4" }))).toBe(
-      "198.51.100.4",
-    );
+  test("adds rate limit headers to allowed responses", async () => {
+    const limiter = createLimiter(2);
+    const response = await limiter(requestWithIp("203.0.113.8"));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("ratelimit")).toContain("limit=2");
+    expect(response.headers.get("ratelimit")).toContain("reset=");
   });
 
-  test("falls back to a shared unknown bucket", () => {
-    expect(getClientIp(requestWith({}))).toBe("unknown");
+  test("keeps buckets isolated per client ip", async () => {
+    const limiter = createLimiter(1);
+
+    expect((await limiter(requestWithIp("203.0.113.9"))).status).toBe(200);
+    expect((await limiter(requestWithIp("203.0.113.9"))).status).toBe(429);
+    expect((await limiter(requestWithIp("198.51.100.4"))).status).toBe(200);
+  });
+
+  test("exposes the documented production policies", () => {
+    expect(RATE_LIMITS.events.limit).toBe(120);
+    expect(RATE_LIMITS.event.limit).toBe(120);
+    expect(RATE_LIMITS.reservations.limit).toBe(20);
+
+    for (const policy of Object.values(RATE_LIMITS)) {
+      expect(policy.algorithm).toEqual({
+        type: "sliding-window",
+        windowMs: 60_000,
+      });
+    }
   });
 });
