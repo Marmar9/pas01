@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client";
-import { errorResponse, rateLimitResponse } from "@/lib/api";
-import { checkRateLimit, getClientIp, RATE_LIMITS } from "@/lib/rate-limit";
+import { errorResponse } from "@/lib/api";
+import { RATE_LIMITS, rateLimited } from "@/lib/rate-limit";
 import { createReservation } from "@/lib/reservations";
 import {
   idempotencyKeySchema,
@@ -8,16 +8,7 @@ import {
   toFieldErrors,
 } from "@/lib/validation";
 
-export async function POST(request: Request) {
-  const rateLimit = checkRateLimit(
-    `${getClientIp(request)}:reservations`,
-    RATE_LIMITS.reservations,
-  );
-
-  if (!rateLimit.allowed) {
-    return rateLimitResponse(rateLimit);
-  }
-
+async function handler(request: Request) {
   let body: unknown;
 
   try {
@@ -113,3 +104,5 @@ export async function POST(request: Request) {
     return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.");
   }
 }
+
+export const POST = rateLimited(handler, RATE_LIMITS.reservations);
