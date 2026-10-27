@@ -9,10 +9,13 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 <!-- END:nextjs-agent-rules -->
 
 ## Project overview
+
 Purpose: Cinema ticket reservation software
 
 ## Contract
+
 # API
+
 GET  /api/events           → { events: [...] }
 GET  /api/events/:id       → { event, takenSeats: ["A2", "B1"] }
 POST /api/reservations     headers: Idempotency-Key: <8-128 printable chars>
@@ -24,18 +27,22 @@ key → 409 IDEMPOTENCY_KEY_REUSED.
 All endpoints: 429 RATE_LIMITED with Retry-After when the sliding-window IP limit
 is exceeded, 500 INTERNAL_ERROR on unexpected failures.
 Errors → { error, code, details? }
+
 # WEB INTERFACE
+
 /                          event list
 /events/:id                event by id
 /reserve?eventId=…&seatId=…  reservation form
 /reservations/:code        redirect page with reservation code
 
 ## Techstack
+
 runtime: bun
 endpoints: Nextjs
 db: Drizzle orm, better-sqlite3 driver
 
 ## Code quaity
+
 1. Before commiting any changes validate changed files with biome linter "bun run lint" command. If linter fails, correct the mistakes.
 2. All commits are to be made following the conventional commits specification: "
 The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL NOT”, “SHOULD”, “SHOULD NOT”, “RECOMMENDED”, “MAY”, and “OPTIONAL” in this document are to be interpreted as described in RFC 2119.
@@ -59,14 +66,20 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 "
 3. Each feature, bugfix, refactor or any other change purpose must be created on apropriate new branch (not master), the branch follows naming convention alike conventional commits specification: <CHANGE_TYPE>/<WHATS CHANGED>.
 4. The agent uses git only for creating commits, branches and switching between them. Any other action is strictly forbidden.
+5. use libraries where possible instead of implementing stuff yourself. you must look for popular, good libraries.
 
 # Reliability rules
+
 ## Api
+
 1. All api endpoints must be reliable (error resistant). Endpoits which must be idempotent (e.g. creating reservation) must implement idempotency using idempotency key.
 2. Api endpoit which executes multiple write operations must use transactions.
 3. Api endpoits are protected by sliding window rate limiting by ip.
+
 ## Web
+
 1. Any api calls made from the web client must retry 3 times if connection is broken or response dosent arrive after timespan of 5 seconds. If endpoint call is to be idempotent idempotency key is sent inside the request.
 
-# !! WARNING !!
+# !! WARNING
+
 Before changing anything related to: Contract (adding, removing endpoits ect.) and Techstack (adding, removing, chaneging dependency solutions), ask user for permission, then make apropriate changes in "AGENTS.md" file.
