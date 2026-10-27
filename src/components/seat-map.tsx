@@ -61,7 +61,7 @@ export function SeatMap({
                     }
                     onClick={() => onSelect(isSelected ? null : seatId)}
                     className={[
-                      "grid size-7 place-items-center rounded-t-md text-[10px] font-semibold transition-all duration-150 sm:size-8 focus-ring",
+                      "grid size-7 place-items-center rounded-t-md text-[10px] font-semibold transition-all duration-150 focus-ring sm:size-8 lg:size-9 lg:text-[11px]",
                       isTaken
                         ? "cursor-not-allowed bg-zinc-800 text-zinc-600"
                         : isSelected
