@@ -89,7 +89,7 @@ export function ReserveView() {
               <button
                 type="button"
                 onClick={() => load({ active: true })}
-                className="btn-cta"
+                className="btn-primary"
               >
                 Spróbuj ponownie
               </button>

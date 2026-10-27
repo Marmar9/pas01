@@ -33,7 +33,7 @@ export default function ReservePage() {
 
         <div className="mx-auto mt-8 max-w-2xl">
           <p className="eyebrow text-secondary">Ostatni krok</p>
-          <h1 className="display-title mt-3 text-4xl text-white sm:text-5xl">
+          <h1 className="font-display mt-3 text-4xl font-black tracking-tight text-white sm:text-5xl">
             Zarezerwuj fotel
           </h1>
           <p className="mt-4 text-sm text-zinc-400">

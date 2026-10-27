@@ -6,7 +6,7 @@ import { EventPoster } from "@/components/event-poster";
 import { SeatMap } from "@/components/seat-map";
 import { StateCard } from "@/components/state-card";
 import { ApiError, type EventDto, getEvent } from "@/lib/client-api";
-import { formatEventDate, formatEventWeekday } from "@/lib/format";
+import { formatEventTime, formatEventWeekday } from "@/lib/format";
 import { countFreeSeats } from "@/lib/seats";
 
 type DetailState =
@@ -137,7 +137,7 @@ export function EventDetail({ eventId }: { eventId: string }) {
                   <dd className="text-right font-semibold text-white">
                     {formatEventWeekday(state.event.startsAt)}
                     <span className="block text-xs font-normal text-zinc-400">
-                      {formatEventDate(state.event.startsAt)}
+                      godz. {formatEventTime(state.event.startsAt)}
                     </span>
                   </dd>
                 </div>

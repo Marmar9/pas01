@@ -169,7 +169,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
       <div className="surface-card p-6 sm:p-8">
         <p className="eyebrow text-secondary">Twoja rezerwacja</p>
         <h2 className="mt-3 text-2xl font-black text-white">{event.title}</h2>
-        <dl className="mt-6 grid gap-4 text-sm sm:grid-cols-2">
+        <dl className="mt-6 grid gap-4 text-sm sm:grid-cols-3">
           <div>
             <dt className="text-xs uppercase tracking-[0.2em] text-zinc-500">
               Termin
@@ -180,13 +180,13 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
           </div>
           <div>
             <dt className="text-xs uppercase tracking-[0.2em] text-zinc-500">
-              Miejsce
+              Sala
             </dt>
             <dd className="mt-1 font-semibold text-white">{event.venue}</dd>
           </div>
           <div>
             <dt className="text-xs uppercase tracking-[0.2em] text-zinc-500">
-              Fotel
+              Miejsce
             </dt>
             <dd className="mt-1 font-semibold text-secondary">{seatId}</dd>
           </div>
@@ -285,7 +285,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
         <button
           type="submit"
           disabled={disabled}
-          className="btn-cta w-full justify-center disabled:cursor-not-allowed disabled:opacity-50"
+          className="btn-primary w-full justify-center disabled:cursor-not-allowed disabled:opacity-50"
         >
           {pending ? (
             "Rezerwujemy…"
