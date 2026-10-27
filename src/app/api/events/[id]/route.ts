@@ -1,20 +1,36 @@
 import { connection } from "next/server";
 import { getDb } from "@/db/client";
-import { errorResponse } from "@/lib/api";
+import { errorResponse, rateLimitResponse } from "@/lib/api";
 import { getEventWithTakenSeats } from "@/lib/events";
+import { checkRateLimit, getClientIp, RATE_LIMITS } from "@/lib/rate-limit";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: RouteContext<"/api/events/[id]">,
 ) {
   await connection();
 
-  const { id } = await context.params;
-  const result = getEventWithTakenSeats(getDb(), id);
+  const rateLimit = checkRateLimit(
+    `${getClientIp(request)}:event`,
+    RATE_LIMITS.event,
+  );
 
-  if (!result) {
-    return errorResponse(404, "EVENT_NOT_FOUND", "Event not found.");
+  if (!rateLimit.allowed) {
+    return rateLimitResponse(rateLimit);
   }
 
-  return Response.json(result);
+  const { id } = await context.params;
+
+  try {
+    const result = getEventWithTakenSeats(getDb(), id);
+
+    if (!result) {
+      return errorResponse(404, "EVENT_NOT_FOUND", "Event not found.");
+    }
+
+    return Response.json(result);
+  } catch (error) {
+    console.error("Failed to load event:", error);
+    return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.");
+  }
 }
