@@ -1,1 +1,1 @@
-# Cinema ticker reservation project
+# Cinema ticke reservation project
