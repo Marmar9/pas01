@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { generateReservationCode } from "@/lib/reservation-code";
 import {
+  idempotencyKeySchema,
   isSeatInLayout,
   parseSeatId,
   reservationInputSchema,
@@ -79,5 +80,22 @@ describe("reservation codes", () => {
     }
 
     expect(codes.size).toBe(50);
+  });
+});
+
+describe("idempotency keys", () => {
+  test("accepts printable keys between 8 and 128 characters", () => {
+    expect(idempotencyKeySchema.safeParse("abc-123_XYZ").success).toBe(true);
+    expect(idempotencyKeySchema.safeParse("x".repeat(128)).success).toBe(true);
+  });
+
+  test("rejects missing, short and non-printable keys", () => {
+    expect(idempotencyKeySchema.safeParse(undefined).success).toBe(false);
+    expect(idempotencyKeySchema.safeParse("short").success).toBe(false);
+    expect(idempotencyKeySchema.safeParse("x".repeat(129)).success).toBe(false);
+    expect(idempotencyKeySchema.safeParse("key with spaces").success).toBe(
+      false,
+    );
+    expect(idempotencyKeySchema.safeParse("klucz-zażółć").success).toBe(false);
   });
 });
