@@ -60,4 +60,8 @@ Errors are returned as `{ error, code, details? }`:
 - `500 INTERNAL_ERROR`
 
 Rate limits are in-memory and per process: 120 requests/min for event reads and
-20 requests/min for reservations.
+20 requests/min for reservations. They are enforced by `universal-rate-limit`
+with a sliding-window algorithm and an in-memory store.
+
+Reservation codes are generated with `nanoid`, and idempotency request
+fingerprints use `object-hash` (SHA-256).

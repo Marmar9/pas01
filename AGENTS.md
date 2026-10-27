@@ -40,6 +40,7 @@ Errors → { error, code, details? }
 runtime: bun
 endpoints: Nextjs
 db: Drizzle orm, better-sqlite3 driver
+libraries: nanoid (reservation codes), object-hash (idempotency fingerprints), @universal-rate-limit/nextjs (sliding-window IP rate limiting)
 
 ## Code quaity
 
