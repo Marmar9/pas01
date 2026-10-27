@@ -13,10 +13,17 @@ Purpose: Cinema ticket reservation software
 
 ## Contract
 # API
-GET  /api/events           → event list
+GET  /api/events           → { events: [...] }
 GET  /api/events/:id       → { event, takenSeats: ["A2", "B1"] }
-POST /api/reservations     { eventId, seatId, customerName, email }
+POST /api/reservations     headers: Idempotency-Key: <8-128 printable chars>
+                           { eventId, seatId, customerName, email }
                            → { reservationId, code }
+Repeated POST with the same Idempotency-Key and payload replays the original
+response (header Idempotency-Replayed: true); a different payload under the same
+key → 409 IDEMPOTENCY_KEY_REUSED.
+All endpoints: 429 RATE_LIMITED with Retry-After when the sliding-window IP limit
+is exceeded, 500 INTERNAL_ERROR on unexpected failures.
+Errors → { error, code, details? }
 # WEB INTERFACE
 /                          event list
 /events/:id                event by id

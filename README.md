@@ -40,11 +40,24 @@ location with the `DATABASE_PATH` environment variable.
 | ------ | ------------------- | ---------------------------------------------- |
 | `GET`  | `/api/events`       | `{ events: Event[] }`                          |
 | `GET`  | `/api/events/:id`   | `{ event, takenSeats: string[] }`              |
-| `POST` | `/api/reservations` | `{ eventId, seatId, customerName, email }` → `{ reservationId, code }` |
+| `POST` | `/api/reservations` | `Idempotency-Key` header + `{ eventId, seatId, customerName, email }` → `{ reservationId, code }` |
 
 `Event` shape: `{ id, title, description, venue, startsAt, rows, seatsPerRow }`.
 Seats are `<row letter><number>`, e.g. `A2`, and must fit the event's
 `rows × seatsPerRow` layout.
 
-Errors are returned as `{ error, code, details? }` with `400`
-(`VALIDATION_ERROR`), `404` (`EVENT_NOT_FOUND`) or `409` (`SEAT_TAKEN`).
+`POST /api/reservations` requires an `Idempotency-Key` header (8–128 printable
+ASCII characters). Repeating a request with the same key and payload replays the
+original response with `Idempotency-Replayed: true`; reusing a key with a
+different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+
+Errors are returned as `{ error, code, details? }`:
+
+- `400 VALIDATION_ERROR`
+- `404 EVENT_NOT_FOUND`
+- `409 SEAT_TAKEN` / `IDEMPOTENCY_KEY_REUSED`
+- `429 RATE_LIMITED` (sliding-window IP limit, includes `Retry-After`)
+- `500 INTERNAL_ERROR`
+
+Rate limits are in-memory and per process: 120 requests/min for event reads and
+20 requests/min for reservations.
