@@ -28,6 +28,16 @@ export const reservationInputSchema = z.object({
     .transform((value) => value.toLowerCase()),
 });
 
+export const idempotencyKeySchema = z
+  .string()
+  .trim()
+  .min(8, "Idempotency key must be at least 8 characters.")
+  .max(128, "Idempotency key must be at most 128 characters.")
+  .regex(
+    /^[\x21-\x7E]+$/,
+    "Idempotency key must contain printable ASCII characters only.",
+  );
+
 export type ReservationInput = z.infer<typeof reservationInputSchema>;
 
 export type ParsedSeat = {
