@@ -15,9 +15,12 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
+    "@universal-rate-limit/nextjs": "^2.2.0",
     "better-sqlite3": "^13.0.3",
     "drizzle-orm": "^0.45.4",
+    "nanoid": "^6.0.2",
     "next": "16.4.3",
+    "object-hash": "^3.0.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "zod": "^4.6.7"
@@ -27,6 +30,7 @@
     "@tailwindcss/turbopack": "^4",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^20",
+    "@types/object-hash": "^3.0.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "babel-plugin-react-compiler": "1.0.0",

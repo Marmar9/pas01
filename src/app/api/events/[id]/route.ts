@@ -1,23 +1,14 @@
 import { connection } from "next/server";
 import { getDb } from "@/db/client";
-import { errorResponse, rateLimitResponse } from "@/lib/api";
+import { errorResponse } from "@/lib/api";
 import { getEventWithTakenSeats } from "@/lib/events";
-import { checkRateLimit, getClientIp, RATE_LIMITS } from "@/lib/rate-limit";
+import { RATE_LIMITS, rateLimited } from "@/lib/rate-limit";
 
-export async function GET(
-  request: Request,
+async function handler(
+  _request: Request,
   context: RouteContext<"/api/events/[id]">,
 ) {
   await connection();
-
-  const rateLimit = checkRateLimit(
-    `${getClientIp(request)}:event`,
-    RATE_LIMITS.event,
-  );
-
-  if (!rateLimit.allowed) {
-    return rateLimitResponse(rateLimit);
-  }
 
   const { id } = await context.params;
 
@@ -34,3 +25,5 @@ export async function GET(
     return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.");
   }
 }
+
+export const GET = rateLimited(handler, RATE_LIMITS.event);

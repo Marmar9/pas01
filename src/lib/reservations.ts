@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { and, eq, lt } from "drizzle-orm";
+import objectHash from "object-hash";
 import type { Db } from "@/db/client";
 import { events, idempotencyKeys, reservations } from "@/db/schema";
 import { generateReservationCode } from "./reservation-code";
@@ -44,16 +44,15 @@ function normalizeInput(input: CreateReservationInput): NormalizedInput {
 }
 
 function hashReservationRequest(input: NormalizedInput): string {
-  return createHash("sha256")
-    .update(
-      JSON.stringify([
-        input.eventId,
-        input.seatId,
-        input.customerName,
-        input.email,
-      ]),
-    )
-    .digest("hex");
+  return objectHash(
+    {
+      eventId: input.eventId,
+      seatId: input.seatId,
+      customerName: input.customerName,
+      email: input.email,
+    },
+    { algorithm: "sha256", encoding: "hex" },
+  );
 }
 
 function findConstraintError(error: unknown): SqliteConstraintError | null {
