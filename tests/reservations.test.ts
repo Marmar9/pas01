@@ -130,6 +130,39 @@ describe("createReservation", () => {
     expect(db.select().from(idempotencyKeys).all()).toHaveLength(1);
   });
 
+  test("treats payloads with reordered keys as the same request", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const key = "key-order-123";
+    const first = createReservation(db, {
+      eventId: duneEvent.id,
+      seatId: "A2",
+      customerName: "Ada Lovelace",
+      email: "ada@example.com",
+      idempotencyKey: key,
+    });
+    const second = createReservation(db, {
+      email: "ada@example.com",
+      customerName: "Ada Lovelace",
+      seatId: "A2",
+      eventId: duneEvent.id,
+      idempotencyKey: key,
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+
+    if (!first.ok || !second.ok) {
+      return;
+    }
+
+    expect(second.replayed).toBe(true);
+    expect(second.reservationId).toBe(first.reservationId);
+    expect(second.code).toBe(first.code);
+    expect(db.select().from(reservations).all()).toHaveLength(1);
+  });
+
   test("rejects an idempotency key reused with a different payload", () => {
     const db = createTestDb();
     seedTestEvents(db);
