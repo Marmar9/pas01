@@ -42,5 +42,21 @@ export const reservations = sqliteTable(
   ],
 );
 
+export const idempotencyKeys = sqliteTable(
+  "idempotency_keys",
+  {
+    key: text("key").primaryKey(),
+    requestHash: text("request_hash").notNull(),
+    reservationId: text("reservation_id")
+      .notNull()
+      .references(() => reservations.id, { onDelete: "cascade" }),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+  },
+  (table) => [index("idempotency_keys_created_at_idx").on(table.createdAt)],
+);
+
 export type EventRow = typeof events.$inferSelect;
 export type ReservationRow = typeof reservations.$inferSelect;
+export type IdempotencyKeyRow = typeof idempotencyKeys.$inferSelect;
