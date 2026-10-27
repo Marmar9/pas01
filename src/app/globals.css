@@ -1,26 +1,143 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-primary: #3813c2;
+  --color-primary-dark: #2a0e96;
+  --color-secondary: #e50f88;
+  --color-secondary-dark: #b80c6c;
+  --color-ink: #0b0713;
+  --color-ink-soft: #140d22;
+  --font-sans: var(--font-roboto), ui-sans-serif, system-ui, sans-serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 6rem;
+  }
+
+  body {
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: #e50f88;
+    color: #ffffff;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
+      animation: none;
+
+      transition: none;
+    }
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer components {
+  .container-page {
+    margin-inline: auto;
+    width: 100%;
+    max-width: 80rem;
+    padding-inline: 1rem;
+  }
+
+  @media (min-width: 1024px) {
+    .container-page {
+      padding-inline: 3rem;
+    }
+  }
+
+  .text-gradient {
+    background-image: linear-gradient(
+      100deg,
+      #7c5cff 0%,
+      #e50f88 65%,
+      #ff7ac1 100%
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .brand-gradient {
+    background-image: linear-gradient(135deg, #3813c2 0%, #e50f88 100%);
+  }
+
+  .glow-blob {
+    position: absolute;
+    border-radius: 9999px;
+    filter: blur(90px);
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  .surface-card {
+    border-radius: 1.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    background-color: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(14px);
+  }
+
+  .focus-ring:focus-visible {
+    outline: 2px solid #e50f88;
+    outline-offset: 3px;
+  }
+
+  .poster-grain {
+    background-image:
+      radial-gradient(
+        circle at 18% 22%,
+        rgba(255, 255, 255, 0.22) 0,
+        transparent 45%
+      ),
+      radial-gradient(circle at 82% 78%, rgba(0, 0, 0, 0.35) 0, transparent 55%);
+  }
+}
+
+@keyframes tk-pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.75);
+  }
+}
+
+@keyframes tk-rise {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes tk-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-pulse-dot {
+  animation: tk-pulse-dot 1.8s ease-in-out infinite;
+}
+
+.animate-rise {
+  animation: tk-rise 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.animate-spin-slow {
+  animation: tk-spin 0.9s linear infinite;
 }
