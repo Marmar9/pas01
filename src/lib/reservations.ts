@@ -117,121 +117,127 @@ export function createReservation(
   const expiresBefore = new Date(Date.now() - IDEMPOTENCY_KEY_TTL_MS);
 
   try {
-    return db.transaction((tx) => {
-      tx.delete(idempotencyKeys)
-        .where(lt(idempotencyKeys.createdAt, expiresBefore))
-        .run();
+    // BEGIN IMMEDIATE takes the write lock before the reads, so competing
+    // writers (even across processes) queue on busy_timeout instead of
+    // failing to upgrade a stale read snapshot with SQLITE_BUSY_SNAPSHOT.
+    return db.transaction(
+      (tx) => {
+        tx.delete(idempotencyKeys)
+          .where(lt(idempotencyKeys.createdAt, expiresBefore))
+          .run();
 
-      const existingKey = tx
-        .select()
-        .from(idempotencyKeys)
-        .where(eq(idempotencyKeys.key, input.idempotencyKey))
-        .get();
-
-      if (existingKey) {
-        if (existingKey.requestHash !== requestHash) {
-          return { ok: false, reason: "idempotency_key_reused" };
-        }
-
-        const reservation = tx
+        const existingKey = tx
           .select()
-          .from(reservations)
-          .where(eq(reservations.id, existingKey.reservationId))
+          .from(idempotencyKeys)
+          .where(eq(idempotencyKeys.key, input.idempotencyKey))
           .get();
 
-        if (reservation) {
-          return {
-            ok: true,
-            reservationId: reservation.id,
-            code: reservation.code,
-            replayed: true,
-          };
-        }
+        if (existingKey) {
+          if (existingKey.requestHash !== requestHash) {
+            return { ok: false, reason: "idempotency_key_reused" };
+          }
 
-        tx.delete(idempotencyKeys)
-          .where(eq(idempotencyKeys.key, existingKey.key))
-          .run();
-      }
-
-      const event = tx
-        .select()
-        .from(events)
-        .where(eq(events.id, normalized.eventId))
-        .get();
-
-      if (!event) {
-        return { ok: false, reason: "event_not_found" };
-      }
-
-      const seat = parseSeatId(normalized.seatId);
-
-      if (!seat || !isSeatInLayout(seat, event.rows, event.seatsPerRow)) {
-        return { ok: false, reason: "invalid_seat" };
-      }
-
-      const taken = tx
-        .select({ id: reservations.id })
-        .from(reservations)
-        .where(
-          and(
-            eq(reservations.eventId, normalized.eventId),
-            eq(reservations.seatId, normalized.seatId),
-          ),
-        )
-        .get();
-
-      if (taken) {
-        return { ok: false, reason: "seat_taken" };
-      }
-
-      for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
-        const code = generateReservationCode();
-
-        try {
-          const inserted = tx
-            .insert(reservations)
-            .values({
-              id: crypto.randomUUID(),
-              eventId: normalized.eventId,
-              seatId: normalized.seatId,
-              customerName: normalized.customerName,
-              email: normalized.email,
-              code,
-            })
-            .returning({ id: reservations.id, code: reservations.code })
+          const reservation = tx
+            .select()
+            .from(reservations)
+            .where(eq(reservations.id, existingKey.reservationId))
             .get();
 
-          tx.insert(idempotencyKeys)
-            .values({
-              key: input.idempotencyKey,
-              requestHash,
-              reservationId: inserted.id,
-            })
+          if (reservation) {
+            return {
+              ok: true,
+              reservationId: reservation.id,
+              code: reservation.code,
+              replayed: true,
+            };
+          }
+
+          tx.delete(idempotencyKeys)
+            .where(eq(idempotencyKeys.key, existingKey.key))
             .run();
+        }
 
-          return {
-            ok: true,
-            reservationId: inserted.id,
-            code: inserted.code,
-            replayed: false,
-          };
-        } catch (error) {
-          const constraint = findConstraintError(error);
+        const event = tx
+          .select()
+          .from(events)
+          .where(eq(events.id, normalized.eventId))
+          .get();
 
-          if (!constraint) {
+        if (!event) {
+          return { ok: false, reason: "event_not_found" };
+        }
+
+        const seat = parseSeatId(normalized.seatId);
+
+        if (!seat || !isSeatInLayout(seat, event.rows, event.seatsPerRow)) {
+          return { ok: false, reason: "invalid_seat" };
+        }
+
+        const taken = tx
+          .select({ id: reservations.id })
+          .from(reservations)
+          .where(
+            and(
+              eq(reservations.eventId, normalized.eventId),
+              eq(reservations.seatId, normalized.seatId),
+            ),
+          )
+          .get();
+
+        if (taken) {
+          return { ok: false, reason: "seat_taken" };
+        }
+
+        for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
+          const code = generateReservationCode();
+
+          try {
+            const inserted = tx
+              .insert(reservations)
+              .values({
+                id: crypto.randomUUID(),
+                eventId: normalized.eventId,
+                seatId: normalized.seatId,
+                customerName: normalized.customerName,
+                email: normalized.email,
+                code,
+              })
+              .returning({ id: reservations.id, code: reservations.code })
+              .get();
+
+            tx.insert(idempotencyKeys)
+              .values({
+                key: input.idempotencyKey,
+                requestHash,
+                reservationId: inserted.id,
+              })
+              .run();
+
+            return {
+              ok: true,
+              reservationId: inserted.id,
+              code: inserted.code,
+              replayed: false,
+            };
+          } catch (error) {
+            const constraint = findConstraintError(error);
+
+            if (!constraint) {
+              throw error;
+            }
+
+            if (constraint.message.includes("reservations.code")) {
+              continue;
+            }
+
             throw error;
           }
-
-          if (constraint.message.includes("reservations.code")) {
-            continue;
-          }
-
-          throw error;
         }
-      }
 
-      throw new Error("Could not generate a unique reservation code.");
-    });
+        throw new Error("Could not generate a unique reservation code.");
+      },
+      { behavior: "immediate" },
+    );
   } catch (error) {
     const constraint = findConstraintError(error);
 
