@@ -91,7 +91,10 @@ async function handler(request: Request) {
     }
 
     return Response.json(
-      { reservationId: result.reservationId, code: result.code },
+      {
+        reservationId: result.reservationId,
+        expiresAt: result.expiresAt,
+      },
       {
         status: 201,
         headers: result.replayed

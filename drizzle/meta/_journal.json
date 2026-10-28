@@ -15,6 +15,13 @@
       "when": 1793114395000,
       "tag": "0001_purple_puppet_master",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793188433956,
+      "tag": "0002_add_purchase_flow",
+      "breakpoints": true
     }
   ]
 }

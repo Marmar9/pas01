@@ -1,6 +1,8 @@
 export type ApiErrorCode =
   | "VALIDATION_ERROR"
   | "EVENT_NOT_FOUND"
+  | "RESERVATION_NOT_FOUND"
+  | "RESERVATION_EXPIRED"
   | "SEAT_TAKEN"
   | "IDEMPOTENCY_KEY_REUSED"
   | "RATE_LIMITED"
@@ -32,6 +34,10 @@ export type ReservationInput = {
 
 export type ReservationResult = {
   reservationId: string;
+  expiresAt: string;
+};
+
+export type PurchaseResult = {
   code: string;
 };
 
@@ -88,6 +94,8 @@ function toErrorCode(value: unknown): ApiErrorCode {
   const codes: ApiErrorCode[] = [
     "VALIDATION_ERROR",
     "EVENT_NOT_FOUND",
+    "RESERVATION_NOT_FOUND",
+    "RESERVATION_EXPIRED",
     "SEAT_TAKEN",
     "IDEMPOTENCY_KEY_REUSED",
     "RATE_LIMITED",
@@ -249,7 +257,7 @@ export async function createReservation(
 ): Promise<ReservationResult> {
   const payload = await requestJson<{
     reservationId?: unknown;
-    code?: unknown;
+    expiresAt?: unknown;
   }>("/api/reservations", {
     method: "POST",
     headers: {
@@ -262,8 +270,30 @@ export async function createReservation(
   if (
     !isRecord(payload) ||
     typeof payload.reservationId !== "string" ||
-    typeof payload.code !== "string"
+    typeof payload.expiresAt !== "string"
   ) {
+    throw new ApiError(
+      200,
+      "INVALID_RESPONSE",
+      "Serwer nie zwrócił danych rezerwacji.",
+    );
+  }
+
+  return {
+    reservationId: payload.reservationId,
+    expiresAt: payload.expiresAt,
+  };
+}
+
+export async function purchaseReservation(
+  reservationId: string,
+): Promise<PurchaseResult> {
+  const payload = await requestJson<{ code?: unknown }>(
+    `/api/reservations/${encodeURIComponent(reservationId)}/purchase`,
+    { method: "POST" },
+  );
+
+  if (!isRecord(payload) || typeof payload.code !== "string") {
     throw new ApiError(
       200,
       "INVALID_RESPONSE",
@@ -271,5 +301,5 @@ export async function createReservation(
     );
   }
 
-  return { reservationId: payload.reservationId, code: payload.code };
+  return { code: payload.code };
 }

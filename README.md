@@ -36,32 +36,42 @@ location with the `DATABASE_PATH` environment variable.
 
 ## API
 
-| Method | Route               | Description                                    |
-| ------ | ------------------- | ---------------------------------------------- |
-| `GET`  | `/api/events`       | `{ events: Event[] }`                          |
-| `GET`  | `/api/events/:id`   | `{ event, takenSeats: string[] }`              |
-| `POST` | `/api/reservations` | `Idempotency-Key` header + `{ eventId, seatId, customerName, email }` → `{ reservationId, code }` |
+| Method | Route                              | Description                                    |
+| ------ | ---------------------------------- | ---------------------------------------------- |
+| `GET`  | `/api/events`                      | `{ events: Event[] }`                          |
+| `GET`  | `/api/events/:id`                  | `{ event, takenSeats: string[] }`              |
+| `POST` | `/api/reservations`                | `Idempotency-Key` header + `{ eventId, seatId, customerName, email }` → `{ reservationId, expiresAt }` |
+| `POST` | `/api/reservations/:id/purchase`   | `{ code }`                                     |
 
 `Event` shape: `{ id, title, description, venue, startsAt, rows, seatsPerRow }`.
 Seats are `<row letter><number>`, e.g. `A2`, and must fit the event's
 `rows × seatsPerRow` layout.
 
 `POST /api/reservations` requires an `Idempotency-Key` header (8–128 printable
-ASCII characters). Repeating a request with the same key and payload replays the
-original response with `Idempotency-Replayed: true`; reusing a key with a
-different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+ASCII characters). It creates a 15-minute hold and returns `{ reservationId,
+expiresAt }` (ISO-8601 UTC). Repeating a request with the same key and payload
+replays the original response with `Idempotency-Replayed: true`; reusing a key
+with a different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+
+`POST /api/reservations/:id/purchase` completes the purchase and returns the
+reservation `{ code }`. Calling it again returns the same code. Purchasing an
+expired hold returns `410 RESERVATION_EXPIRED`, and an unknown reservation id
+returns `404 RESERVATION_NOT_FOUND`. Expired holds stop blocking their seat, so
+it can be reserved again.
 
 Errors are returned as `{ error, code, details? }`:
 
 - `400 VALIDATION_ERROR`
-- `404 EVENT_NOT_FOUND`
+- `404 EVENT_NOT_FOUND` / `RESERVATION_NOT_FOUND`
 - `409 SEAT_TAKEN` / `IDEMPOTENCY_KEY_REUSED`
+- `410 RESERVATION_EXPIRED`
 - `429 RATE_LIMITED` (sliding-window IP limit, includes `Retry-After`)
 - `500 INTERNAL_ERROR`
 
-Rate limits are in-memory and per process: 120 requests/min for event reads and
-20 requests/min for reservations. They are enforced by `universal-rate-limit`
-with a sliding-window algorithm and an in-memory store.
+Rate limits are in-memory and per process: 120 requests/min for event reads, 20
+requests/min for reservation creation, and 20 requests/min for purchases. They
+are enforced by `universal-rate-limit` with a sliding-window algorithm and an
+in-memory store.
 
-Reservation codes are generated with `nanoid`, and idempotency request
-fingerprints use `object-hash` (SHA-256).
+Reservation codes are generated with `nanoid` at purchase time, and idempotency
+request fingerprints use `object-hash` (SHA-256).

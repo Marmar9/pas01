@@ -70,6 +70,7 @@ describe("rateLimited", () => {
     expect(RATE_LIMITS.events.limit).toBe(120);
     expect(RATE_LIMITS.event.limit).toBe(120);
     expect(RATE_LIMITS.reservations.limit).toBe(20);
+    expect(RATE_LIMITS.purchase.limit).toBe(20);
 
     for (const policy of Object.values(RATE_LIMITS)) {
       expect(policy.algorithm).toEqual({

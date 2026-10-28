@@ -84,7 +84,7 @@ export function Confirmation({ code, eventId, seatId }: ConfirmationProps) {
             <span className="text-gradient">potwierdzona</span>
           </h1>
           <p className="mt-5 max-w-md text-sm leading-relaxed text-zinc-400">
-            Miejsce jest zablokowane. Zapisz kod i pokaż go przy wejściu do
+            Miejsce jest zarezerwowane. Zapisz kod i pokaż go przy wejściu do
             sali.
           </p>
         </div>

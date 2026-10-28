@@ -4,6 +4,7 @@ import {
   createReservation,
   getEvent,
   getEvents,
+  purchaseReservation,
 } from "@/lib/client-api";
 
 const originalFetch = globalThis.fetch;
@@ -48,16 +49,64 @@ describe("client api", () => {
         throw new TypeError("Failed to fetch");
       }
 
-      return jsonResponse({ reservationId: "res-1", code: "ABC123" }, 201);
+      return jsonResponse(
+        {
+          reservationId: "res-1",
+          expiresAt: "2026-10-28T12:15:00.000Z",
+        },
+        201,
+      );
     }) as typeof fetch;
 
     const result = await createReservation(reservationInput, "key-12345678");
 
-    expect(result).toEqual({ reservationId: "res-1", code: "ABC123" });
+    expect(result).toEqual({
+      reservationId: "res-1",
+      expiresAt: "2026-10-28T12:15:00.000Z",
+    });
     expect(calls).toBe(4);
     expect(new Set(seenKeys).size).toBe(1);
     expect(seenKeys[0]).toBe("key-12345678");
   }, 10000);
+
+  test("purchases a reservation and retries network failures", async () => {
+    let calls = 0;
+
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      calls += 1;
+
+      expect(String(input)).toBe("/api/reservations/res-1/purchase");
+      expect(init?.method).toBe("POST");
+
+      if (calls < 2) {
+        throw new TypeError("Failed to fetch");
+      }
+
+      return jsonResponse({ code: "ABC12345" });
+    }) as typeof fetch;
+
+    const result = await purchaseReservation("res-1");
+
+    expect(result).toEqual({ code: "ABC12345" });
+    expect(calls).toBe(2);
+  }, 10000);
+
+  test("exposes reservation purchase errors", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        { error: "Reservation has expired.", code: "RESERVATION_EXPIRED" },
+        410,
+      )) as typeof fetch;
+
+    const error = await purchaseReservation("res-1").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(410);
+    expect(error.code).toBe("RESERVATION_EXPIRED");
+  });
 
   test("does not retry validation errors and exposes details", async () => {
     let calls = 0;

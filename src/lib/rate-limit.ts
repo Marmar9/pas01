@@ -20,6 +20,10 @@ export const RATE_LIMITS = {
     limit: 20,
     algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
   },
+  purchase: {
+    limit: 20,
+    algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
+  },
 } as const satisfies Record<string, NextjsRateLimitOptions>;
 
 export const RATE_LIMIT_MESSAGE = {

@@ -1,4 +1,4 @@
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, gt, lt, lte, ne } from "drizzle-orm";
 import objectHash from "object-hash";
 import type { Db } from "@/db/client";
 import { events, idempotencyKeys, reservations } from "@/db/schema";
@@ -14,7 +14,7 @@ export type CreateReservationInput = {
 };
 
 export type CreateReservationResult =
-  | { ok: true; reservationId: string; code: string; replayed: boolean }
+  | { ok: true; reservationId: string; expiresAt: string; replayed: boolean }
   | {
       ok: false;
       reason:
@@ -23,6 +23,12 @@ export type CreateReservationResult =
         | "seat_taken"
         | "idempotency_key_reused";
     };
+
+export type PurchaseReservationResult =
+  | { ok: true; code: string }
+  | { ok: false; reason: "reservation_not_found" | "reservation_expired" };
+
+export const RESERVATION_HOLD_TTL_MS = 15 * 60 * 1000;
 
 const MAX_CODE_ATTEMPTS = 5;
 const IDEMPOTENCY_KEY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -103,7 +109,7 @@ function replayExistingKey(
   return {
     ok: true,
     reservationId: reservation.id,
-    code: reservation.code,
+    expiresAt: reservation.expiresAt.toISOString(),
     replayed: true,
   };
 }
@@ -114,7 +120,6 @@ export function createReservation(
 ): CreateReservationResult {
   const normalized = normalizeInput(input);
   const requestHash = hashReservationRequest(normalized);
-  const expiresBefore = new Date(Date.now() - IDEMPOTENCY_KEY_TTL_MS);
 
   try {
     // BEGIN IMMEDIATE takes the write lock before the reads, so competing
@@ -122,6 +127,13 @@ export function createReservation(
     // failing to upgrade a stale read snapshot with SQLITE_BUSY_SNAPSHOT.
     return db.transaction(
       (tx) => {
+        // Read the clock only after the lock is held: a request may have
+        // waited on a competing writer, and holds must be judged against
+        // the time the transaction actually starts.
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + RESERVATION_HOLD_TTL_MS);
+        const expiresBefore = new Date(now.getTime() - IDEMPOTENCY_KEY_TTL_MS);
+
         tx.delete(idempotencyKeys)
           .where(lt(idempotencyKeys.createdAt, expiresBefore))
           .run();
@@ -147,7 +159,7 @@ export function createReservation(
             return {
               ok: true,
               reservationId: reservation.id,
-              code: reservation.code,
+              expiresAt: reservation.expiresAt.toISOString(),
               replayed: true,
             };
           }
@@ -173,6 +185,20 @@ export function createReservation(
           return { ok: false, reason: "invalid_seat" };
         }
 
+        // Expired holds no longer block the seat. Mark them explicitly so the
+        // partial unique index accepts a new hold for the same seat.
+        tx.update(reservations)
+          .set({ status: "expired" })
+          .where(
+            and(
+              eq(reservations.eventId, normalized.eventId),
+              eq(reservations.seatId, normalized.seatId),
+              eq(reservations.status, "held"),
+              lte(reservations.expiresAt, now),
+            ),
+          )
+          .run();
+
         const taken = tx
           .select({ id: reservations.id })
           .from(reservations)
@@ -180,6 +206,7 @@ export function createReservation(
             and(
               eq(reservations.eventId, normalized.eventId),
               eq(reservations.seatId, normalized.seatId),
+              ne(reservations.status, "expired"),
             ),
           )
           .get();
@@ -188,53 +215,36 @@ export function createReservation(
           return { ok: false, reason: "seat_taken" };
         }
 
-        for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
-          const code = generateReservationCode();
+        const inserted = tx
+          .insert(reservations)
+          .values({
+            id: crypto.randomUUID(),
+            eventId: normalized.eventId,
+            seatId: normalized.seatId,
+            customerName: normalized.customerName,
+            email: normalized.email,
+            code: null,
+            status: "held",
+            expiresAt,
+            purchasedAt: null,
+          })
+          .returning({ id: reservations.id })
+          .get();
 
-          try {
-            const inserted = tx
-              .insert(reservations)
-              .values({
-                id: crypto.randomUUID(),
-                eventId: normalized.eventId,
-                seatId: normalized.seatId,
-                customerName: normalized.customerName,
-                email: normalized.email,
-                code,
-              })
-              .returning({ id: reservations.id, code: reservations.code })
-              .get();
+        tx.insert(idempotencyKeys)
+          .values({
+            key: input.idempotencyKey,
+            requestHash,
+            reservationId: inserted.id,
+          })
+          .run();
 
-            tx.insert(idempotencyKeys)
-              .values({
-                key: input.idempotencyKey,
-                requestHash,
-                reservationId: inserted.id,
-              })
-              .run();
-
-            return {
-              ok: true,
-              reservationId: inserted.id,
-              code: inserted.code,
-              replayed: false,
-            };
-          } catch (error) {
-            const constraint = findConstraintError(error);
-
-            if (!constraint) {
-              throw error;
-            }
-
-            if (constraint.message.includes("reservations.code")) {
-              continue;
-            }
-
-            throw error;
-          }
-        }
-
-        throw new Error("Could not generate a unique reservation code.");
+        return {
+          ok: true,
+          reservationId: inserted.id,
+          expiresAt: expiresAt.toISOString(),
+          replayed: false,
+        };
       },
       { behavior: "immediate" },
     );
@@ -255,4 +265,113 @@ export function createReservation(
 
     throw error;
   }
+}
+
+export function purchaseReservation(
+  db: Db,
+  reservationId: string,
+): PurchaseReservationResult {
+  return db.transaction(
+    (tx) => {
+      // Judge expiry only after BEGIN IMMEDIATE has acquired the write lock;
+      // otherwise a request that waited for the lock could purchase a hold
+      // that expired while it was queued.
+      const now = new Date();
+      const reservation = tx
+        .select()
+        .from(reservations)
+        .where(eq(reservations.id, reservationId))
+        .get();
+
+      if (!reservation) {
+        return { ok: false, reason: "reservation_not_found" };
+      }
+
+      if (reservation.status === "purchased") {
+        if (!reservation.code) {
+          throw new Error("Purchased reservation is missing its code.");
+        }
+
+        return { ok: true, code: reservation.code };
+      }
+
+      if (
+        reservation.status === "expired" ||
+        reservation.expiresAt.getTime() <= now.getTime()
+      ) {
+        if (reservation.status !== "expired") {
+          tx.update(reservations)
+            .set({ status: "expired" })
+            .where(
+              and(
+                eq(reservations.id, reservationId),
+                eq(reservations.status, "held"),
+              ),
+            )
+            .run();
+        }
+
+        return { ok: false, reason: "reservation_expired" };
+      }
+
+      for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
+        const code = generateReservationCode();
+
+        try {
+          const updated = tx
+            .update(reservations)
+            .set({ status: "purchased", code, purchasedAt: now })
+            .where(
+              and(
+                eq(reservations.id, reservationId),
+                eq(reservations.status, "held"),
+                gt(reservations.expiresAt, now),
+              ),
+            )
+            .returning({ code: reservations.code })
+            .get();
+
+          if (updated) {
+            if (!updated.code) {
+              throw new Error("Purchased reservation is missing its code.");
+            }
+
+            return { ok: true, code: updated.code };
+          }
+
+          const current = tx
+            .select()
+            .from(reservations)
+            .where(eq(reservations.id, reservationId))
+            .get();
+
+          if (current?.status === "purchased" && current.code) {
+            return { ok: true, code: current.code };
+          }
+
+          if (current?.status === "held") {
+            tx.update(reservations)
+              .set({ status: "expired" })
+              .where(eq(reservations.id, reservationId))
+              .run();
+
+            return { ok: false, reason: "reservation_expired" };
+          }
+
+          throw new Error("Reservation could not be purchased.");
+        } catch (error) {
+          const constraint = findConstraintError(error);
+
+          if (constraint?.message.includes("reservations.code")) {
+            continue;
+          }
+
+          throw error;
+        }
+      }
+
+      throw new Error("Could not generate a unique reservation code.");
+    },
+    { behavior: "immediate" },
+  );
 }
