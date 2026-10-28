@@ -115,7 +115,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
     );
   }
 
-  async function createAndPurchase() {
+  async function createHold() {
     if (!idempotencyKey.current) {
       idempotencyKey.current = crypto.randomUUID();
     }
@@ -149,8 +149,6 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
     const nextHold = { reservationId: reservation.reservationId, expiresAt };
     setHold(nextHold);
     setRemainingMs(expiresAt - Date.now());
-
-    await completePurchase(nextHold);
   }
 
   async function handleSubmit(formEvent: React.FormEvent<HTMLFormElement>) {
@@ -182,7 +180,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
 
     setPending(true);
     try {
-      await createAndPurchase();
+      await createHold();
     } catch (error) {
       handleError(error);
     } finally {
@@ -202,7 +200,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
 
     setPending(true);
     try {
-      await createAndPurchase();
+      await createHold();
     } catch (error) {
       handleError(error);
     } finally {
@@ -310,7 +308,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
             <span className="font-mono text-base font-bold text-secondary">
               {formatCountdown(remainingMs)}
             </span>
-            . Dokończ rezerwację, zanim blokada wygaśnie.
+            . Kliknij „Kup bilet”, aby sfinalizować rezerwację.
           </p>
         ) : null}
       </div>
@@ -447,17 +445,17 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
           >
             {pending ? (
               hold ? (
-                "Kończymy rezerwację…"
+                "Kupujemy bilet…"
               ) : (
-                "Rezerwujemy…"
+                "Blokujemy miejsce…"
               )
             ) : locked ? (
               `Poczekaj ${secondsLeft} s`
             ) : hold ? (
-              "Dokończ zakup"
+              "Kup bilet"
             ) : (
               <>
-                Potwierdź rezerwację
+                Zarezerwuj miejsce
                 <svg
                   viewBox="0 0 24 24"
                   fill="none"
