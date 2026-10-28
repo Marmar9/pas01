@@ -20,7 +20,8 @@ GET  /api/events           → { events: [...] }
 GET  /api/events/:id       → { event, takenSeats: ["A2", "B1"] }
 POST /api/reservations     headers: Idempotency-Key: <8-128 printable chars>
                            { eventId, seatId, customerName, email }
-                           → { reservationId, code }
+                           → { reservationId, expiresAt }
+POST /api/reservations/:id/purchase -> { code } or error if the reservation expired
 Repeated POST with the same Idempotency-Key and payload replays the original
 response (header Idempotency-Replayed: true); a different payload under the same
 key → 409 IDEMPOTENCY_KEY_REUSED.
