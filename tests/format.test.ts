@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  formatCountdown,
   formatEventDate,
   formatEventDateShort,
   formatRetryAfter,
@@ -34,6 +35,18 @@ describe("format helpers", () => {
       "Infinity",
     );
     expect(formatRetryAfter(0)).toBe("spróbuj ponownie za chwilę");
+  });
+
+  test("formats a hold countdown", () => {
+    expect(formatCountdown(90_000)).toBe("01:30");
+    expect(formatCountdown(59_100)).toBe("01:00");
+    expect(formatCountdown(1)).toBe("00:01");
+  });
+
+  test("clamps an elapsed hold countdown to zero", () => {
+    expect(formatCountdown(0)).toBe("00:00");
+    expect(formatCountdown(-500)).toBe("00:00");
+    expect(formatCountdown(Number.NaN)).toBe("00:00");
   });
 
   test("falls back for invalid dates", () => {
