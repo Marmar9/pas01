@@ -359,7 +359,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
               type="text"
               autoComplete="name"
               value={customerName}
-              readOnly={fieldsLocked}
+              readOnly={fieldsLocked || pending}
               onChange={(changeEvent) => {
                 setCustomerName(changeEvent.target.value);
                 setFieldErrors((current) => ({
@@ -391,7 +391,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
               type="email"
               autoComplete="email"
               value={email}
-              readOnly={fieldsLocked}
+              readOnly={fieldsLocked || pending}
               onChange={(changeEvent) => {
                 setEmail(changeEvent.target.value);
                 setFieldErrors((current) => ({
