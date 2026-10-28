@@ -8,6 +8,12 @@ import {
 } from "@/lib/events";
 import { createTestDb, duneEvent, seedTestEvents } from "./helpers";
 
+const HOLD_TTL_MS = 15 * 60 * 1000;
+
+function futureHold() {
+  return new Date(Date.now() + HOLD_TTL_MS);
+}
+
 describe("events service", () => {
   test("lists events ordered by start date", () => {
     const db = createTestDb();
@@ -43,7 +49,9 @@ describe("events service", () => {
           seatId: "A10",
           customerName: "Ada",
           email: "ada@example.com",
-          code: "CODE0001",
+          code: null,
+          status: "held",
+          expiresAt: futureHold(),
         },
         {
           id: "reservation-2",
@@ -52,6 +60,9 @@ describe("events service", () => {
           customerName: "Bob",
           email: "bob@example.com",
           code: "CODE0002",
+          status: "purchased",
+          expiresAt: new Date(Date.now() - 1000),
+          purchasedAt: new Date(Date.now() - 2000),
         },
       ])
       .run();
@@ -60,6 +71,48 @@ describe("events service", () => {
 
     expect(result?.event.id).toBe(duneEvent.id);
     expect(result?.takenSeats).toEqual(["A2", "A10"]);
+  });
+
+  test("excludes expired and stale holds from taken seats", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    db.insert(reservations)
+      .values([
+        {
+          id: "expired-status",
+          eventId: duneEvent.id,
+          seatId: "B1",
+          customerName: "Ada",
+          email: "ada@example.com",
+          code: null,
+          status: "expired",
+          expiresAt: new Date(Date.now() - 1000),
+        },
+        {
+          id: "stale-held",
+          eventId: duneEvent.id,
+          seatId: "B2",
+          customerName: "Bob",
+          email: "bob@example.com",
+          code: null,
+          status: "held",
+          expiresAt: new Date(Date.now() - 1000),
+        },
+        {
+          id: "active-held",
+          eventId: duneEvent.id,
+          seatId: "B3",
+          customerName: "Cara",
+          email: "cara@example.com",
+          code: null,
+          status: "held",
+          expiresAt: futureHold(),
+        },
+      ])
+      .run();
+
+    expect(listTakenSeats(db, duneEvent.id)).toEqual(["B3"]);
   });
 
   test("returns null for unknown events", () => {

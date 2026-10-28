@@ -1,4 +1,4 @@
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq, gt, or } from "drizzle-orm";
 import type { Db } from "@/db/client";
 import { type EventRow, events, reservations } from "@/db/schema";
 
@@ -43,10 +43,20 @@ export function getEvent(db: Db, eventId: string): EventRow | null {
 }
 
 export function listTakenSeats(db: Db, eventId: string): string[] {
+  const now = new Date();
+
   return db
     .select({ seatId: reservations.seatId })
     .from(reservations)
-    .where(eq(reservations.eventId, eventId))
+    .where(
+      and(
+        eq(reservations.eventId, eventId),
+        or(
+          eq(reservations.status, "purchased"),
+          and(eq(reservations.status, "held"), gt(reservations.expiresAt, now)),
+        ),
+      ),
+    )
     .all()
     .map((reservation) => reservation.seatId)
     .sort((left, right) =>

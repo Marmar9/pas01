@@ -2,7 +2,12 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { ApiError, createReservation, type EventDto } from "@/lib/client-api";
+import {
+  ApiError,
+  createReservation,
+  type EventDto,
+  purchaseReservation,
+} from "@/lib/client-api";
 import { formatEventDate } from "@/lib/format";
 
 type ReserveFormProps = {
@@ -90,7 +95,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
         idempotencyKey.current = crypto.randomUUID();
       }
 
-      const result = await createReservation(
+      const reservation = await createReservation(
         {
           eventId: event.id,
           seatId,
@@ -100,8 +105,10 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
         idempotencyKey.current,
       );
 
+      const purchase = await purchaseReservation(reservation.reservationId);
+
       router.push(
-        `/reservations/${encodeURIComponent(result.code)}?eventId=${encodeURIComponent(
+        `/reservations/${encodeURIComponent(purchase.code)}?eventId=${encodeURIComponent(
           event.id,
         )}&seatId=${encodeURIComponent(seatId)}`,
       );
@@ -150,6 +157,14 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
         break;
       case "EVENT_NOT_FOUND":
         setFormError("Ten seans nie jest już dostępny.");
+        break;
+      case "RESERVATION_EXPIRED":
+        idempotencyKey.current = crypto.randomUUID();
+        setFormError("Rezerwacja miejsca wygasła. Spróbuj ponownie za chwilę.");
+        break;
+      case "RESERVATION_NOT_FOUND":
+        idempotencyKey.current = crypto.randomUUID();
+        setFormError("Nie znaleziono rezerwacji. Spróbuj ponownie.");
         break;
       case "NETWORK_ERROR":
         setFormError(
