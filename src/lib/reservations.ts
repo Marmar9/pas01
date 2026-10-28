@@ -28,7 +28,20 @@ export type PurchaseReservationResult =
   | { ok: true; code: string }
   | { ok: false; reason: "reservation_not_found" | "reservation_expired" };
 
-export const RESERVATION_HOLD_TTL_MS = 15 * 60 * 1000;
+const PRODUCTION_HOLD_TTL_MS = 15 * 60 * 1000;
+const DEVELOPMENT_HOLD_TTL_MS = 2 * 60 * 1000;
+
+export function getReservationHoldTtlMs(
+  environment: string | undefined = process.env.NODE_ENV,
+): number {
+  return environment === "production"
+    ? PRODUCTION_HOLD_TTL_MS
+    : DEVELOPMENT_HOLD_TTL_MS;
+}
+
+// Convenience value for callers that need the TTL at import time (tests, UI
+// copy). Request handling reads the environment again inside the transaction.
+export const RESERVATION_HOLD_TTL_MS = getReservationHoldTtlMs();
 
 const MAX_CODE_ATTEMPTS = 5;
 const IDEMPOTENCY_KEY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -131,7 +144,7 @@ export function createReservation(
         // waited on a competing writer, and holds must be judged against
         // the time the transaction actually starts.
         const now = new Date();
-        const expiresAt = new Date(now.getTime() + RESERVATION_HOLD_TTL_MS);
+        const expiresAt = new Date(now.getTime() + getReservationHoldTtlMs());
         const expiresBefore = new Date(now.getTime() - IDEMPOTENCY_KEY_TTL_MS);
 
         tx.delete(idempotencyKeys)

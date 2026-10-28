@@ -48,8 +48,9 @@ Seats are `<row letter><number>`, e.g. `A2`, and must fit the event's
 `rows × seatsPerRow` layout.
 
 `POST /api/reservations` requires an `Idempotency-Key` header (8–128 printable
-ASCII characters). It creates a 15-minute hold and returns `{ reservationId,
-expiresAt }` (ISO-8601 UTC). Repeating a request with the same key and payload
+ASCII characters). It creates a hold and returns `{ reservationId, expiresAt }`
+(ISO-8601 UTC). Holds last 15 minutes when `NODE_ENV=production` and 2 minutes
+otherwise (development/test). Repeating a request with the same key and payload
 replays the original response with `Idempotency-Replayed: true`; reusing a key
 with a different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
 

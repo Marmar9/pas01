@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { idempotencyKeys, reservations } from "@/db/schema";
 import {
   createReservation,
+  getReservationHoldTtlMs,
   purchaseReservation,
   RESERVATION_HOLD_TTL_MS,
 } from "@/lib/reservations";
@@ -27,6 +28,18 @@ function expireReservations(db: ReturnType<typeof createTestDb>) {
     .set({ expiresAt: new Date(Date.now() - 1000) })
     .run();
 }
+
+describe("reservation hold TTL", () => {
+  test("uses 15 minutes in production", () => {
+    expect(getReservationHoldTtlMs("production")).toBe(15 * 60 * 1000);
+  });
+
+  test("uses 2 minutes outside production", () => {
+    expect(getReservationHoldTtlMs("development")).toBe(2 * 60 * 1000);
+    expect(getReservationHoldTtlMs("test")).toBe(2 * 60 * 1000);
+    expect(getReservationHoldTtlMs("staging")).toBe(2 * 60 * 1000);
+  });
+});
 
 describe("createReservation", () => {
   test("creates a hold with an expiry and no code", () => {
