@@ -12,6 +12,7 @@ type LoadState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "missing"; message: string }
+  | { status: "taken"; event: EventDto; seatId: string }
   | { status: "ready"; event: EventDto; seatId: string };
 
 export function ReserveView() {
@@ -36,9 +37,16 @@ export function ReserveView() {
 
       getEvent(rawEventId)
         .then((data) => {
-          if (signal.active) {
-            setState({ status: "ready", event: data.event, seatId });
+          if (!signal.active) {
+            return;
           }
+
+          if (data.takenSeats.includes(seatId)) {
+            setState({ status: "taken", event: data.event, seatId });
+            return;
+          }
+
+          setState({ status: "ready", event: data.event, seatId });
         })
         .catch((error: unknown) => {
           if (!signal.active) {
@@ -70,6 +78,30 @@ export function ReserveView() {
         icon="spinner"
         title="Przygotowujemy formularz"
         description="Sprawdzamy szczegóły seansu i dostępność fotela."
+      />
+    );
+  }
+
+  if (state.status === "taken") {
+    return (
+      <StateCard
+        icon="warning"
+        title="To miejsce jest już zajęte"
+        description={`Miejsce ${state.seatId} jest zablokowane lub sprzedane. Blokada może wygasnąć — sprawdź ponownie albo wybierz inny fotel.`}
+        action={
+          <>
+            <button
+              type="button"
+              onClick={() => load({ active: true })}
+              className="btn-primary"
+            >
+              Sprawdź ponownie
+            </button>
+            <Link href={`/events/${state.event.id}`} className="btn-ghost">
+              Wybierz inne miejsce
+            </Link>
+          </>
+        }
       />
     );
   }
