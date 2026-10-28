@@ -15,9 +15,12 @@ type DetailState =
   | { status: "error"; message: string }
   | { status: "ready"; event: EventDto; takenSeats: string[] };
 
+const SEAT_REFRESH_INTERVAL_MS = 15_000;
+
 export function EventDetail({ eventId }: { eventId: string }) {
   const [state, setState] = useState<DetailState>({ status: "loading" });
   const [selected, setSelected] = useState<string | null>(null);
+  const [seatNotice, setSeatNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setState({ status: "loading" });
@@ -48,6 +51,56 @@ export function EventDetail({ eventId }: { eventId: string }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const refresh = useCallback(async () => {
+    try {
+      const result = await getEvent(eventId);
+      setState((current) =>
+        current.status === "ready"
+          ? {
+              status: "ready",
+              event: result.event,
+              takenSeats: result.takenSeats,
+            }
+          : current,
+      );
+
+      if (selected && result.takenSeats.includes(selected)) {
+        setSelected(null);
+        setSeatNotice(
+          `Miejsce ${selected} zostało właśnie zarezerwowane. Wybierz inne.`,
+        );
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "EVENT_NOT_FOUND") {
+        setState({ status: "not-found" });
+      }
+      // Background refreshes keep the last known seat map on failure.
+    }
+  }, [eventId, selected]);
+
+  useEffect(() => {
+    if (state.status !== "ready") {
+      return;
+    }
+
+    const refreshIfVisible = () => {
+      if (document.visibilityState === "visible") {
+        void refresh();
+      }
+    };
+
+    const timer = window.setInterval(
+      refreshIfVisible,
+      SEAT_REFRESH_INTERVAL_MS,
+    );
+    document.addEventListener("visibilitychange", refreshIfVisible);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshIfVisible);
+    };
+  }, [state.status, refresh]);
 
   return (
     <div className="container-page pb-24 pt-28 sm:pt-32">
@@ -164,7 +217,8 @@ export function EventDetail({ eventId }: { eventId: string }) {
                   Wybierz miejsce
                 </h2>
                 <p className="mt-1 text-sm text-zinc-400">
-                  Kliknij wolny fotel. Zajęte miejsca są nieaktywne.
+                  Kliknij wolny fotel. Zajęte miejsca są nieaktywne. Plan
+                  odświeża się automatycznie.
                 </p>
               </div>
               <span className="rounded-full bg-emerald-400/10 px-3 py-1.5 text-xs font-semibold text-emerald-300 ring-1 ring-emerald-400/20">
@@ -177,13 +231,22 @@ export function EventDetail({ eventId }: { eventId: string }) {
               </span>
             </div>
 
+            {seatNotice ? (
+              <output className="mt-6 block rounded-xl border border-secondary/30 bg-secondary/10 px-4 py-3 text-sm text-white">
+                {seatNotice}
+              </output>
+            ) : null}
+
             <div className="mt-8">
               <SeatMap
                 rows={state.event.rows}
                 seatsPerRow={state.event.seatsPerRow}
                 takenSeats={state.takenSeats}
                 selected={selected}
-                onSelect={setSelected}
+                onSelect={(seat) => {
+                  setSeatNotice(null);
+                  setSelected(seat);
+                }}
               />
             </div>
 
