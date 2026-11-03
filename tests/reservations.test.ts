@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { idempotencyKeys, reservations } from "@/db/schema";
+import { eq } from "drizzle-orm";
+import { events, idempotencyKeys, reservations } from "@/db/schema";
 import {
   createReservation,
   getReservationHoldTtlMs,
+  getReservationState,
   purchaseReservation,
   RESERVATION_HOLD_TTL_MS,
+  startCheckout,
 } from "@/lib/reservations";
 import { createTestDb, duneEvent, seedTestEvents } from "./helpers";
 
@@ -59,6 +62,7 @@ describe("createReservation", () => {
     expect(result.expiresAt).toMatch(
       /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
     );
+    expect(result.amount).toBe(duneEvent.price);
     expect("code" in result).toBe(false);
 
     const expiresAt = new Date(result.expiresAt).getTime();
@@ -72,6 +76,7 @@ describe("createReservation", () => {
     expect(stored).toHaveLength(1);
     expect(stored[0].seatId).toBe("A2");
     expect(stored[0].code).toBeNull();
+    expect(stored[0].amount).toBe(duneEvent.price);
     expect(stored[0].status).toBe("held");
     expect(stored[0].purchasedAt).toBeNull();
     expect(stored[0].expiresAt.toISOString()).toBe(result.expiresAt);
@@ -160,9 +165,40 @@ describe("createReservation", () => {
     expect(second.replayed).toBe(true);
     expect(second.reservationId).toBe(first.reservationId);
     expect(second.expiresAt).toBe(first.expiresAt);
+    expect(second.amount).toBe(first.amount);
 
     expect(db.select().from(reservations).all()).toHaveLength(1);
     expect(db.select().from(idempotencyKeys).all()).toHaveLength(1);
+  });
+
+  test("keeps the amount captured when the hold was created", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const input = reservationInput({ idempotencyKey: "amount-snapshot-key" });
+    const first = createReservation(db, input);
+
+    expect(first.ok).toBe(true);
+
+    if (!first.ok) {
+      return;
+    }
+
+    db.update(events)
+      .set({ price: 9900 })
+      .where(eq(events.id, duneEvent.id))
+      .run();
+
+    const replay = createReservation(db, input);
+
+    expect(replay.ok).toBe(true);
+
+    if (!replay.ok) {
+      return;
+    }
+
+    expect(replay.amount).toBe(duneEvent.price);
+    expect(db.select().from(reservations).get()?.amount).toBe(duneEvent.price);
   });
 
   test("replays the original hold after it expired", () => {
@@ -318,6 +354,153 @@ describe("createReservation", () => {
   });
 });
 
+describe("getReservationState", () => {
+  test("returns a held reservation with its amount and expiry", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const created = createReservation(db, reservationInput());
+
+    expect(created.ok).toBe(true);
+
+    if (!created.ok) {
+      return;
+    }
+
+    expect(getReservationState(db, created.reservationId)).toEqual({
+      status: "held",
+      amount: duneEvent.price,
+      expiresAt: created.expiresAt,
+      code: null,
+    });
+  });
+
+  test("returns a paid reservation with its ticket code", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const created = createReservation(db, reservationInput());
+
+    expect(created.ok).toBe(true);
+
+    if (!created.ok) {
+      return;
+    }
+
+    const purchased = purchaseReservation(db, created.reservationId);
+
+    expect(purchased.ok).toBe(true);
+
+    if (!purchased.ok) {
+      return;
+    }
+
+    expect(getReservationState(db, created.reservationId)).toEqual({
+      status: "paid",
+      amount: duneEvent.price,
+      expiresAt: created.expiresAt,
+      code: purchased.code,
+    });
+  });
+
+  test("reports a stale hold as expired and persists the status", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const created = createReservation(db, reservationInput());
+
+    expect(created.ok).toBe(true);
+
+    if (!created.ok) {
+      return;
+    }
+
+    expireReservations(db);
+
+    expect(getReservationState(db, created.reservationId)?.status).toBe(
+      "expired",
+    );
+    expect(db.select().from(reservations).get()?.status).toBe("expired");
+  });
+
+  test("returns null for unknown reservations", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    expect(getReservationState(db, "missing-reservation")).toBeNull();
+  });
+});
+
+describe("startCheckout", () => {
+  test("reports an unknown reservation", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    expect(startCheckout(db, "missing-reservation")).toEqual({
+      ok: false,
+      reason: "reservation_not_found",
+    });
+  });
+
+  test("refuses to check out an expired hold and marks it expired", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const created = createReservation(db, reservationInput());
+
+    expect(created.ok).toBe(true);
+
+    if (!created.ok) {
+      return;
+    }
+
+    expireReservations(db);
+
+    expect(startCheckout(db, created.reservationId)).toEqual({
+      ok: false,
+      reason: "reservation_expired",
+    });
+    expect(db.select().from(reservations).get()?.status).toBe("expired");
+  });
+
+  test("refuses to check out an already paid reservation", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const created = createReservation(db, reservationInput());
+
+    expect(created.ok).toBe(true);
+
+    if (!created.ok) {
+      return;
+    }
+
+    expect(purchaseReservation(db, created.reservationId).ok).toBe(true);
+    expect(startCheckout(db, created.reservationId)).toEqual({
+      ok: false,
+      reason: "reservation_already_paid",
+    });
+  });
+
+  test("reports payments as unavailable until Stripe is configured", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const created = createReservation(db, reservationInput());
+
+    expect(created.ok).toBe(true);
+
+    if (!created.ok) {
+      return;
+    }
+
+    expect(startCheckout(db, created.reservationId)).toEqual({
+      ok: false,
+      reason: "payment_unavailable",
+    });
+  });
+});
+
 describe("purchaseReservation", () => {
   test("issues a code for an active hold and marks it purchased", () => {
     const db = createTestDb();
@@ -343,7 +526,7 @@ describe("purchaseReservation", () => {
 
     const stored = db.select().from(reservations).get();
 
-    expect(stored?.status).toBe("purchased");
+    expect(stored?.status).toBe("paid");
     expect(stored?.code).toBe(purchased.code);
     expect(stored?.purchasedAt).toBeInstanceOf(Date);
   });
