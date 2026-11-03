@@ -11,6 +11,7 @@ const seedEvents = [
     startsAt: new Date("2026-11-05T19:00:00+01:00"),
     rows: 10,
     seatsPerRow: 14,
+    price: 3200,
   },
   {
     id: "6f0f0f7c-1e5a-4a7e-9d5b-2b8a0c4e1f02",
@@ -21,6 +22,7 @@ const seedEvents = [
     startsAt: new Date("2026-11-06T17:30:00+01:00"),
     rows: 8,
     seatsPerRow: 12,
+    price: 3200,
   },
   {
     id: "6f0f0f7c-1e5a-4a7e-9d5b-2b8a0c4e1f03",
@@ -31,6 +33,7 @@ const seedEvents = [
     startsAt: new Date("2026-11-07T20:15:00+01:00"),
     rows: 6,
     seatsPerRow: 10,
+    price: 3200,
   },
 ];
 

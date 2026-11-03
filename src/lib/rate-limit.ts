@@ -24,6 +24,19 @@ export const RATE_LIMITS = {
     limit: 20,
     algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
   },
+  reservation: {
+    limit: 120,
+    algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
+  },
+  checkout: {
+    limit: 20,
+    algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
+  },
+  webhook: {
+    // Stripe may burst finals events; keep this well above request traffic.
+    limit: 600,
+    algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
+  },
 } as const satisfies Record<string, NextjsRateLimitOptions>;
 
 export const RATE_LIMIT_MESSAGE = {

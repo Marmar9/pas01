@@ -16,9 +16,11 @@ export const events = sqliteTable("events", {
   startsAt: integer("starts_at", { mode: "timestamp_ms" }).notNull(),
   rows: integer("rows").notNull(),
   seatsPerRow: integer("seats_per_row").notNull(),
+  // Price per seat in grosze (3200 = 32 zł).
+  price: integer("price").notNull().default(3200),
 });
 
-export const RESERVATION_STATUSES = ["held", "purchased", "expired"] as const;
+export const RESERVATION_STATUSES = ["held", "paid", "expired"] as const;
 export type ReservationStatus = (typeof RESERVATION_STATUSES)[number];
 
 export const reservations = sqliteTable(
@@ -32,6 +34,8 @@ export const reservations = sqliteTable(
     customerName: text("customer_name").notNull(),
     email: text("email").notNull(),
     code: text("code"),
+    // Price captured at reservation time, in grosze.
+    amount: integer("amount").notNull().default(0),
     status: text("status").$type<ReservationStatus>().notNull().default("held"),
     expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
     purchasedAt: integer("purchased_at", { mode: "timestamp_ms" }),
@@ -53,7 +57,7 @@ export const reservations = sqliteTable(
     ),
     check(
       "reservations_status_check",
-      sql`${table.status} in ('held', 'purchased', 'expired')`,
+      sql`${table.status} in ('held', 'paid', 'expired')`,
     ),
   ],
 );

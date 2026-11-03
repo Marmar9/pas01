@@ -19,6 +19,7 @@ export const duneEvent = {
   startsAt: new Date("2026-11-05T18:00:00.000Z"),
   rows: 10,
   seatsPerRow: 14,
+  price: 3200,
 };
 
 export const interstellarEvent = {
@@ -29,6 +30,7 @@ export const interstellarEvent = {
   startsAt: new Date("2026-11-04T18:00:00.000Z"),
   rows: 8,
   seatsPerRow: 12,
+  price: 4500,
 };
 
 export function seedTestEvents(db: Db): void {

@@ -1,7 +1,13 @@
 import { and, eq, gt, lt, lte, ne } from "drizzle-orm";
 import objectHash from "object-hash";
 import type { Db } from "@/db/client";
-import { events, idempotencyKeys, reservations } from "@/db/schema";
+import {
+  events,
+  idempotencyKeys,
+  type ReservationRow,
+  type ReservationStatus,
+  reservations,
+} from "@/db/schema";
 import { generateReservationCode } from "./reservation-code";
 import { isSeatInLayout, parseSeatId } from "./validation";
 
@@ -14,7 +20,13 @@ export type CreateReservationInput = {
 };
 
 export type CreateReservationResult =
-  | { ok: true; reservationId: string; expiresAt: string; replayed: boolean }
+  | {
+      ok: true;
+      reservationId: string;
+      amount: number;
+      expiresAt: string;
+      replayed: boolean;
+    }
   | {
       ok: false;
       reason:
@@ -27,6 +39,24 @@ export type CreateReservationResult =
 export type PurchaseReservationResult =
   | { ok: true; code: string }
   | { ok: false; reason: "reservation_not_found" | "reservation_expired" };
+
+export type ReservationState = {
+  status: ReservationStatus;
+  amount: number;
+  expiresAt: string;
+  code: string | null;
+};
+
+export type StartCheckoutResult =
+  | { ok: true; url: string }
+  | {
+      ok: false;
+      reason:
+        | "reservation_not_found"
+        | "reservation_expired"
+        | "reservation_already_paid"
+        | "payment_unavailable";
+    };
 
 const PRODUCTION_HOLD_TTL_MS = 15 * 60 * 1000;
 const DEVELOPMENT_HOLD_TTL_MS = 2 * 60 * 1000;
@@ -122,6 +152,7 @@ function replayExistingKey(
   return {
     ok: true,
     reservationId: reservation.id,
+    amount: reservation.amount,
     expiresAt: reservation.expiresAt.toISOString(),
     replayed: true,
   };
@@ -172,6 +203,7 @@ export function createReservation(
             return {
               ok: true,
               reservationId: reservation.id,
+              amount: reservation.amount,
               expiresAt: reservation.expiresAt.toISOString(),
               replayed: true,
             };
@@ -237,6 +269,7 @@ export function createReservation(
             customerName: normalized.customerName,
             email: normalized.email,
             code: null,
+            amount: event.price,
             status: "held",
             expiresAt,
             purchasedAt: null,
@@ -255,6 +288,7 @@ export function createReservation(
         return {
           ok: true,
           reservationId: inserted.id,
+          amount: event.price,
           expiresAt: expiresAt.toISOString(),
           replayed: false,
         };
@@ -280,6 +314,100 @@ export function createReservation(
   }
 }
 
+function toReservationState(reservation: ReservationRow): ReservationState {
+  return {
+    status: reservation.status,
+    amount: reservation.amount,
+    expiresAt: reservation.expiresAt.toISOString(),
+    code: reservation.code,
+  };
+}
+
+function markExpired(tx: Db, reservationId: string): void {
+  tx.update(reservations)
+    .set({ status: "expired" })
+    .where(
+      and(eq(reservations.id, reservationId), eq(reservations.status, "held")),
+    )
+    .run();
+}
+
+export function getReservationState(
+  db: Db,
+  reservationId: string,
+): ReservationState | null {
+  return db.transaction(
+    (tx) => {
+      // The write lock is taken up front so a stale hold cannot be reported as
+      // active while another request expires it.
+      const now = new Date();
+      const reservation = tx
+        .select()
+        .from(reservations)
+        .where(eq(reservations.id, reservationId))
+        .get();
+
+      if (!reservation) {
+        return null;
+      }
+
+      if (
+        reservation.status === "held" &&
+        reservation.expiresAt.getTime() <= now.getTime()
+      ) {
+        markExpired(tx, reservationId);
+
+        return { ...toReservationState(reservation), status: "expired" };
+      }
+
+      return toReservationState(reservation);
+    },
+    { behavior: "immediate" },
+  );
+}
+
+export function startCheckout(
+  db: Db,
+  reservationId: string,
+): StartCheckoutResult {
+  return db.transaction(
+    (tx) => {
+      // Judge expiry only after BEGIN IMMEDIATE has acquired the write lock;
+      // otherwise a queued request could start a payment for an expired hold.
+      const now = new Date();
+      const reservation = tx
+        .select()
+        .from(reservations)
+        .where(eq(reservations.id, reservationId))
+        .get();
+
+      if (!reservation) {
+        return { ok: false, reason: "reservation_not_found" };
+      }
+
+      if (reservation.status === "paid") {
+        return { ok: false, reason: "reservation_already_paid" };
+      }
+
+      if (
+        reservation.status === "expired" ||
+        reservation.expiresAt.getTime() <= now.getTime()
+      ) {
+        if (reservation.status !== "expired") {
+          markExpired(tx, reservationId);
+        }
+
+        return { ok: false, reason: "reservation_expired" };
+      }
+
+      // Stripe Checkout is not wired up yet. Once it is, create a Checkout
+      // Session for reservation.amount here and return its url.
+      return { ok: false, reason: "payment_unavailable" };
+    },
+    { behavior: "immediate" },
+  );
+}
+
 export function purchaseReservation(
   db: Db,
   reservationId: string,
@@ -300,7 +428,7 @@ export function purchaseReservation(
         return { ok: false, reason: "reservation_not_found" };
       }
 
-      if (reservation.status === "purchased") {
+      if (reservation.status === "paid") {
         if (!reservation.code) {
           throw new Error("Purchased reservation is missing its code.");
         }
@@ -333,7 +461,7 @@ export function purchaseReservation(
         try {
           const updated = tx
             .update(reservations)
-            .set({ status: "purchased", code, purchasedAt: now })
+            .set({ status: "paid", code, purchasedAt: now })
             .where(
               and(
                 eq(reservations.id, reservationId),
@@ -358,7 +486,7 @@ export function purchaseReservation(
             .where(eq(reservations.id, reservationId))
             .get();
 
-          if (current?.status === "purchased" && current.code) {
+          if (current?.status === "paid" && current.code) {
             return { ok: true, code: current.code };
           }
 

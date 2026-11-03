@@ -34,6 +34,7 @@ describe("events service", () => {
       startsAt: duneEvent.startsAt.toISOString(),
       rows: duneEvent.rows,
       seatsPerRow: duneEvent.seatsPerRow,
+      price: duneEvent.price,
     });
   });
 
@@ -60,7 +61,7 @@ describe("events service", () => {
           customerName: "Bob",
           email: "bob@example.com",
           code: "CODE0002",
-          status: "purchased",
+          status: "paid",
           expiresAt: new Date(Date.now() - 1000),
           purchasedAt: new Date(Date.now() - 2000),
         },

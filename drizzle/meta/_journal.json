@@ -22,6 +22,20 @@
       "when": 1793188433956,
       "tag": "0002_add_purchase_flow",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793743908734,
+      "tag": "0003_add_pricing",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1793743944897,
+      "tag": "0004_status_paid",
+      "breakpoints": true
     }
   ]
 }

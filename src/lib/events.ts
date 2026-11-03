@@ -10,6 +10,7 @@ export type EventDto = {
   startsAt: string;
   rows: number;
   seatsPerRow: number;
+  price: number;
 };
 
 export type EventWithTakenSeats = {
@@ -26,6 +27,7 @@ export function toEventDto(event: EventRow): EventDto {
     startsAt: event.startsAt.toISOString(),
     rows: event.rows,
     seatsPerRow: event.seatsPerRow,
+    price: event.price,
   };
 }
 
@@ -52,7 +54,7 @@ export function listTakenSeats(db: Db, eventId: string): string[] {
       and(
         eq(reservations.eventId, eventId),
         or(
-          eq(reservations.status, "purchased"),
+          eq(reservations.status, "paid"),
           and(eq(reservations.status, "held"), gt(reservations.expiresAt, now)),
         ),
       ),

@@ -18,16 +18,37 @@ Purpose: Cinema ticket reservation software
 
 GET  /api/events           → { events: [...] }
 GET  /api/events/:id       → { event, takenSeats: ["A2", "B1"] }
+                             event.price: price per seat in grosze (3200 = 32 zł)
 POST /api/reservations     headers: Idempotency-Key: <8-128 printable chars>
                            { eventId, seatId, customerName, email }
-                           → { reservationId, expiresAt }
-POST /api/reservations/:id/purchase -> { code } or error if the reservation expired
+                           → { reservationId, amount, expiresAt }
+                             amount: price captured at reservation time, never changes
+GET  /api/reservations/:id → { status, amount, expiresAt, code? }
+                             status: "held" | "paid" | "expired"
+POST /api/reservations/:id/checkout
+                           → { url } (Stripe Checkout page)
+                             409 RESERVATION_ALREADY_PAID when already paid,
+                             410 RESERVATION_EXPIRED when the hold lapsed,
+                             503 PAYMENT_UNAVAILABLE while Stripe is not wired up
+POST /api/webhooks/stripe  Stripe events (checkout.session.completed); signature
+                           verified with STRIPE_WEBHOOK_SECRET; 501
+                           NOT_IMPLEMENTED until Stripe is configured
+POST /api/reservations/:id/purchase -> { code } (DEPRECATED: etap I flow, replaced
+                           by /checkout; responses carry Deprecation: true)
 Repeated POST with the same Idempotency-Key and payload replays the original
 response (header Idempotency-Replayed: true); a different payload under the same
 key → 409 IDEMPOTENCY_KEY_REUSED.
 All endpoints: 429 RATE_LIMITED with Retry-After when the sliding-window IP limit
 is exceeded, 500 INTERNAL_ERROR on unexpected failures.
 Errors → { error, code, details? }
+
+# PAYMENTS (etap II)
+
+Stripe Checkout, test mode only. Currency PLN, amounts in grosze. Server-side env vars (never in the repo or the browser):
+STRIPE_SECRET_KEY (sk_test_…), STRIPE_WEBHOOK_SECRET. Checkout Session carries
+client_reference_id = reservation id and success/cancel URLs pointing at
+/reservations/:id. A webhook marks the reservation paid and issues the ticket
+code; the client polls GET /api/reservations/:id while waiting.
 
 # WEB INTERFACE
 

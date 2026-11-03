@@ -29,7 +29,16 @@ async function handler(
       }
     }
 
-    return Response.json({ code: result.code });
+    return Response.json(
+      { code: result.code },
+      {
+        headers: {
+          Deprecation: "true",
+          Warning:
+            '299 - "Deprecated: use POST /api/reservations/{id}/checkout instead."',
+        },
+      },
+    );
   } catch (error) {
     console.error("Failed to purchase reservation:", error);
     return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.");

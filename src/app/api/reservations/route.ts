@@ -93,6 +93,7 @@ async function handler(request: Request) {
     return Response.json(
       {
         reservationId: result.reservationId,
+        amount: result.amount,
         expiresAt: result.expiresAt,
       },
       {
