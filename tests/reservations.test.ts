@@ -37,17 +37,26 @@ function expireReservations(db: ReturnType<typeof createTestDb>) {
 function fakeGateway(overrides: Partial<CheckoutGateway> = {}) {
   const created: CheckoutSessionInput[] = [];
   const expired: string[] = [];
-  let counter = 0;
+  const sessionsByKey = new Map<string, { id: string; url: string }>();
 
   const gateway: CheckoutGateway = {
+    // Like Stripe, a repeated idempotency key returns the original session.
     async createCheckoutSession(input) {
       created.push(input);
-      counter += 1;
+      const existing = sessionsByKey.get(input.idempotencyKey);
 
-      return {
+      if (existing) {
+        return existing;
+      }
+
+      const counter = sessionsByKey.size + 1;
+      const session = {
         id: `cs_test_${counter}`,
         url: `https://checkout.stripe.test/${counter}`,
       };
+      sessionsByKey.set(input.idempotencyKey, session);
+
+      return session;
     },
     async expireCheckoutSession(sessionId) {
       expired.push(sessionId);
@@ -555,6 +564,7 @@ describe("startCheckout", () => {
         customerEmail: "ada@example.com",
         seatId: "A2",
         eventTitle: duneEvent.title,
+        idempotencyKey: `checkout:${hold.reservationId}:1`,
       },
     ]);
 
@@ -590,6 +600,59 @@ describe("startCheckout", () => {
     expect(second).toEqual(first);
     expect(created).toHaveLength(1);
     expect(db.select().from(payments).all()).toHaveLength(1);
+  });
+
+  test("concurrent checkouts of one attempt share a single Stripe session", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { gateway, created } = fakeGateway();
+
+    const hold = createReservation(db, reservationInput());
+
+    expect(hold.ok).toBe(true);
+
+    if (!hold.ok) {
+      return;
+    }
+
+    // Both calls prepare before either records its session, like a client
+    // retry that fires while the first Stripe request is still in flight.
+    const [first, second] = await Promise.all([
+      startCheckout(db, hold.reservationId, gateway),
+      startCheckout(db, hold.reservationId, gateway),
+    ]);
+
+    expect(created).toHaveLength(2);
+    expect(created[1]?.idempotencyKey).toBe(created[0]?.idempotencyKey);
+    expect(first).toEqual({ ok: true, url: "https://checkout.stripe.test/1" });
+    expect(second).toEqual(first);
+    expect(db.select().from(payments).all()).toHaveLength(1);
+  });
+
+  test("uses a new idempotency key after the previous session expired", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { gateway, created } = fakeGateway();
+
+    const hold = createReservation(db, reservationInput());
+
+    expect(hold.ok).toBe(true);
+
+    if (!hold.ok) {
+      return;
+    }
+
+    await startCheckout(db, hold.reservationId, gateway);
+    db.update(payments).set({ status: "expired" }).run();
+
+    expect(await startCheckout(db, hold.reservationId, gateway)).toEqual({
+      ok: true,
+      url: "https://checkout.stripe.test/2",
+    });
+    expect(created.map((input) => input.idempotencyKey)).toEqual([
+      `checkout:${hold.reservationId}:1`,
+      `checkout:${hold.reservationId}:2`,
+    ]);
   });
 
   test("reports payment_unavailable when Stripe fails", async () => {

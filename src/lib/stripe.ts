@@ -8,6 +8,7 @@ export type CheckoutSessionInput = {
   customerEmail: string;
   eventTitle: string;
   seatId: string;
+  idempotencyKey: string;
 };
 
 export type CheckoutSession = {
@@ -66,31 +67,34 @@ export function getStripeClient(): Stripe | null {
 export function createStripeCheckoutGateway(stripe: Stripe): CheckoutGateway {
   return {
     async createCheckoutSession(input) {
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        client_reference_id: input.reservationId,
-        customer_email: input.customerEmail,
-        metadata: { reservationId: input.reservationId },
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency: STRIPE_CURRENCY,
-              unit_amount: input.amount,
-              product_data: {
-                name: `Bilet: ${input.eventTitle}`,
-                description: `Miejsce ${input.seatId}`,
+      const session = await stripe.checkout.sessions.create(
+        {
+          mode: "payment",
+          client_reference_id: input.reservationId,
+          customer_email: input.customerEmail,
+          metadata: { reservationId: input.reservationId },
+          line_items: [
+            {
+              quantity: 1,
+              price_data: {
+                currency: STRIPE_CURRENCY,
+                unit_amount: input.amount,
+                product_data: {
+                  name: `Bilet: ${input.eventTitle}`,
+                  description: `Miejsce ${input.seatId}`,
+                },
               },
             },
-          },
-        ],
-        success_url: `${getAppUrl()}/reservations/${encodeURIComponent(
-          input.reservationId,
-        )}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${getAppUrl()}/reservations/${encodeURIComponent(
-          input.reservationId,
-        )}/payment/cancel`,
-      });
+          ],
+          success_url: `${getAppUrl()}/reservations/${encodeURIComponent(
+            input.reservationId,
+          )}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${getAppUrl()}/reservations/${encodeURIComponent(
+            input.reservationId,
+          )}/payment/cancel`,
+        },
+        { idempotencyKey: input.idempotencyKey },
+      );
 
       return { id: session.id, url: session.url };
     },
@@ -106,3 +110,4 @@ export function getStripeCheckoutGateway(): CheckoutGateway | null {
 
   return stripe ? createStripeCheckoutGateway(stripe) : null;
 }
+
