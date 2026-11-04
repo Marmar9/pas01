@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { EventPoster } from "@/components/event-poster";
 import type { EventDto } from "@/lib/client-api";
-import { formatEventDateShort } from "@/lib/format";
+import { formatEventDateShort, formatPrice } from "@/lib/format";
 
 type EventCardProps = {
   event: EventDto;
@@ -29,6 +29,9 @@ export function EventCard({ event, freeSeats }: EventCardProps) {
           <span aria-hidden="true">·</span>
           <span>
             {event.rows} × {event.seatsPerRow} miejsc
+          </span>
+          <span className="ml-auto rounded-full bg-secondary/10 px-2.5 py-1 text-secondary">
+            {formatPrice(event.price)}
           </span>
         </div>
 

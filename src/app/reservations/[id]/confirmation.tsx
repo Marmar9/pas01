@@ -76,15 +76,15 @@ export function Confirmation({ code, eventId, seatId }: ConfirmationProps) {
               <span className="absolute inline-flex size-full animate-ping rounded-full bg-secondary opacity-75" />
               <span className="relative inline-flex size-2 rounded-full bg-secondary" />
             </span>
-            Gotowe
+            Bilet gotowy
           </span>
           <h1 className="mt-6 font-display text-4xl font-black uppercase leading-[0.95] tracking-tight text-white sm:text-6xl">
-            Rezerwacja
+            Płatność
             <br />
             <span className="text-gradient">potwierdzona</span>
           </h1>
           <p className="mt-5 max-w-md text-sm leading-relaxed text-zinc-400">
-            Miejsce jest zarezerwowane. Zapisz kod i pokaż go przy wejściu do
+            Twoje miejsce jest opłacone. Zapisz kod i pokaż go przy wejściu do
             sali.
           </p>
         </div>
