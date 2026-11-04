@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+
 // Bun loads .env.local itself, so no `stripe login` is needed.
 
 const WEBHOOK_URL = "localhost:3000/api/webhooks/stripe";
@@ -17,18 +19,12 @@ if (!secretKey?.startsWith("sk_test_")) {
   process.exit(1);
 }
 
-const child = Bun.spawn(
-  [
-    "stripe",
-    "listen",
-    "--forward-to",
-    WEBHOOK_URL,
-    "--events",
-    EVENTS.join(","),
-  ],
+const child = spawn(
+  "stripe",
+  ["listen", "--forward-to", WEBHOOK_URL, "--events", EVENTS.join(",")],
   {
     env: { ...process.env, STRIPE_API_KEY: secretKey },
-    stdio: ["inherit", "inherit", "inherit"],
+    stdio: "inherit",
   },
 );
 
@@ -36,4 +32,4 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => child.kill(signal));
 }
 
-process.exit(await child.exited);
+child.on("exit", (code) => process.exit(code ?? 1));
