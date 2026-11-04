@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { payments, reservations, stripeEvents } from "@/db/schema";
+import { jobs, payments, reservations, stripeEvents } from "@/db/schema";
 import { processStripeEvent } from "@/lib/payments";
+import { refundJobId } from "@/lib/refunds";
 import { createReservation } from "@/lib/reservations";
 import { createTestDb, duneEvent, seedTestEvents } from "./helpers";
 
@@ -340,7 +341,17 @@ describe("processStripeEvent", () => {
 
     expect(reservation?.status).toBe("expired");
     expect(reservation?.code).toBeNull();
-    expect(db.select().from(payments).get()?.status).toBe("paid");
+
+    const payment = db.select().from(payments).get();
+
+    expect(payment?.status).toBe("paid");
+    expect(db.select().from(jobs).all()).toMatchObject([
+      {
+        id: refundJobId(payment?.id ?? ""),
+        task: "refund-payment",
+        input: { paymentId: payment?.id },
+      },
+    ]);
   });
 
   test("keeps the first code when a later session reports the same reservation paid", () => {
@@ -393,6 +404,163 @@ describe("processStripeEvent", () => {
         .where(eq(payments.reservationId, hold.reservationId))
         .all(),
     ).toHaveLength(2);
+
+    const secondPayment = db
+      .select()
+      .from(payments)
+      .where(eq(payments.stripeCheckoutSessionId, "cs_test_2"))
+      .get();
+
+    expect(db.select({ id: jobs.id }).from(jobs).all()).toEqual([
+      { id: refundJobId(secondPayment?.id ?? "") },
+    ]);
+  });
+
+  test("does not refund when the same session is reported paid twice", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    const session = checkoutSession({
+      client_reference_id: hold.reservationId,
+    });
+
+    processStripeEvent(
+      db,
+      stripeEvent("checkout.session.completed", session, "evt_completed"),
+    );
+    processStripeEvent(
+      db,
+      stripeEvent(
+        "checkout.session.async_payment_succeeded",
+        session,
+        "evt_async",
+      ),
+    );
+
+    expect(db.select().from(payments).all()).toHaveLength(1);
+    expect(db.select().from(jobs).all()).toHaveLength(0);
+  });
+
+  test("never turns a refunded payment back into paid", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    const session = checkoutSession({
+      client_reference_id: hold.reservationId,
+    });
+
+    processStripeEvent(
+      db,
+      stripeEvent("checkout.session.completed", session, "evt_first"),
+    );
+    db.update(payments).set({ status: "refunded" }).run();
+    processStripeEvent(
+      db,
+      stripeEvent(
+        "checkout.session.async_payment_succeeded",
+        session,
+        "evt_late",
+      ),
+    );
+
+    expect(db.select().from(payments).get()?.status).toBe("refunded");
+  });
+
+  test("records the outcome of each handled event", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+
+    processStripeEvent(
+      db,
+      stripeEvent(
+        "checkout.session.completed",
+        checkoutSession({ client_reference_id: hold.reservationId }),
+        "evt_ok",
+      ),
+    );
+    processStripeEvent(
+      db,
+      stripeEvent("customer.created", { object: "customer" }, "evt_other"),
+    );
+    processStripeEvent(
+      db,
+      stripeEvent(
+        "checkout.session.completed",
+        checkoutSession({
+          id: "cs_test_wrong",
+          client_reference_id: hold.reservationId,
+          amount_total: 1,
+        }),
+        "evt_mismatch",
+      ),
+    );
+
+    const outcomes = Object.fromEntries(
+      db
+        .select()
+        .from(stripeEvents)
+        .all()
+        .map((row) => [row.id, [row.outcome, row.failureReason]]),
+    );
+
+    expect(outcomes).toEqual({
+      evt_ok: ["processed", null],
+      evt_other: ["ignored", null],
+      evt_mismatch: ["failed", "amount_mismatch"],
+    });
+  });
+
+  test("prunes handled inbox rows after 7 days but keeps failed ones", () => {
+    const db = createTestDb();
+    const now = new Date("2026-11-20T12:00:00.000Z");
+    const eightDaysAgo = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
+    const sixDaysAgo = new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000);
+
+    db.insert(stripeEvents)
+      .values([
+        {
+          id: "evt_old",
+          type: "x",
+          outcome: "processed",
+          processedAt: eightDaysAgo,
+        },
+        {
+          id: "evt_old_ignored",
+          type: "x",
+          outcome: "ignored",
+          processedAt: eightDaysAgo,
+        },
+        {
+          id: "evt_old_failed",
+          type: "x",
+          outcome: "failed",
+          failureReason: "amount_mismatch",
+          processedAt: eightDaysAgo,
+        },
+        {
+          id: "evt_recent",
+          type: "x",
+          outcome: "processed",
+          processedAt: sixDaysAgo,
+        },
+      ])
+      .run();
+
+    processStripeEvent(
+      db,
+      stripeEvent("customer.created", { object: "customer" }, "evt_new"),
+      now,
+    );
+
+    expect(
+      db
+        .select({ id: stripeEvents.id })
+        .from(stripeEvents)
+        .all()
+        .map((row) => row.id)
+        .sort(),
+    ).toEqual(["evt_new", "evt_old_failed", "evt_recent"]);
   });
 
   test("marks a pending payment expired on checkout.session.expired", () => {

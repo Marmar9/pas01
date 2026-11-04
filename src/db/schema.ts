@@ -82,6 +82,7 @@ export const PAYMENT_STATUSES = [
   "paid",
   "failed",
   "expired",
+  "refunded",
 ] as const;
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 
@@ -98,6 +99,7 @@ export const payments = sqliteTable(
     amount: integer("amount").notNull(),
     currency: text("currency").notNull().default("pln"),
     status: text("status").$type<PaymentStatus>().notNull().default("pending"),
+    stripeRefundId: text("stripe_refund_id"),
     createdAt: integer("created_at", { mode: "timestamp_ms" })
       .notNull()
       .default(sql`(unixepoch() * 1000)`),
@@ -118,21 +120,82 @@ export const payments = sqliteTable(
     index("payments_status_created_at_idx").on(table.status, table.createdAt),
     check(
       "payments_status_check",
-      sql`${table.status} in ('pending', 'paid', 'failed', 'expired')`,
+      sql`${table.status} in ('pending', 'paid', 'failed', 'expired', 'refunded')`,
     ),
   ],
 );
 
-export const stripeEvents = sqliteTable("stripe_events", {
-  id: text("id").primaryKey(),
-  type: text("type").notNull(),
-  processedAt: integer("processed_at", { mode: "timestamp_ms" })
-    .notNull()
-    .default(sql`(unixepoch() * 1000)`),
-});
+export const STRIPE_EVENT_OUTCOMES = [
+  "processed",
+  "ignored",
+  "failed",
+] as const;
+export type StripeEventOutcome = (typeof STRIPE_EVENT_OUTCOMES)[number];
+
+// Inbox of handled Stripe webhook events. Rows with outcome "failed" are the
+// dead-letter record for human review and are never pruned.
+export const stripeEvents = sqliteTable(
+  "stripe_events",
+  {
+    id: text("id").primaryKey(),
+    type: text("type").notNull(),
+    outcome: text("outcome")
+      .$type<StripeEventOutcome>()
+      .notNull()
+      .default("processed"),
+    failureReason: text("failure_reason"),
+    processedAt: integer("processed_at", { mode: "timestamp_ms" })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+  },
+  (table) => [
+    index("stripe_events_outcome_processed_at_idx").on(
+      table.outcome,
+      table.processedAt,
+    ),
+    check(
+      "stripe_events_outcome_check",
+      sql`${table.outcome} in ('processed', 'ignored', 'failed')`,
+    ),
+  ],
+);
+
+export const JOB_TASKS = ["refund-payment"] as const;
+export type JobTask = (typeof JOB_TASKS)[number];
+
+// Outbox / background job queue (E06, E07). A job is hidden until visibleAt,
+// acked by completedAt and dead-lettered by hasError.
+export const jobs = sqliteTable(
+  "jobs",
+  {
+    id: text("id").primaryKey(),
+    task: text("task").$type<JobTask>().notNull(),
+    input: text("input", { mode: "json" })
+      .$type<Record<string, string>>()
+      .notNull(),
+    visibleAt: integer("visible_at", { mode: "timestamp_ms" }).notNull(),
+    totalTried: integer("total_tried").notNull().default(0),
+    completedAt: integer("completed_at", { mode: "timestamp_ms" }),
+    hasError: integer("has_error", { mode: "boolean" })
+      .notNull()
+      .default(false),
+    lastError: text("last_error"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+  },
+  (table) => [
+    index("jobs_ready_idx").on(
+      table.completedAt,
+      table.hasError,
+      table.visibleAt,
+    ),
+  ],
+);
 
 export type EventRow = typeof events.$inferSelect;
 export type ReservationRow = typeof reservations.$inferSelect;
 export type IdempotencyKeyRow = typeof idempotencyKeys.$inferSelect;
 export type PaymentRow = typeof payments.$inferSelect;
 export type StripeEventRow = typeof stripeEvents.$inferSelect;
+export type JobRow = typeof jobs.$inferSelect;
