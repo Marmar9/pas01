@@ -3,6 +3,7 @@ import {
   formatCountdown,
   formatEventDate,
   formatEventDateShort,
+  formatPrice,
   formatRetryAfter,
 } from "@/lib/format";
 
@@ -47,6 +48,19 @@ describe("format helpers", () => {
     expect(formatCountdown(0)).toBe("00:00");
     expect(formatCountdown(-500)).toBe("00:00");
     expect(formatCountdown(Number.NaN)).toBe("00:00");
+  });
+
+  test("formats grosze as Polish złoty", () => {
+    expect(formatPrice(3200)).toBe("32 zł");
+    expect(formatPrice(3250)).toBe("32,50 zł");
+    expect(formatPrice(3205)).toBe("32,05 zł");
+    expect(formatPrice(0)).toBe("0 zł");
+  });
+
+  test("falls back for unusable prices", () => {
+    expect(formatPrice(-1)).toBe("—");
+    expect(formatPrice(Number.NaN)).toBe("—");
+    expect(formatPrice(Number.POSITIVE_INFINITY)).toBe("—");
   });
 
   test("falls back for invalid dates", () => {

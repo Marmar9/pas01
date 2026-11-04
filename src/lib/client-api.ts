@@ -3,8 +3,11 @@ export type ApiErrorCode =
   | "EVENT_NOT_FOUND"
   | "RESERVATION_NOT_FOUND"
   | "RESERVATION_EXPIRED"
+  | "RESERVATION_ALREADY_PAID"
   | "SEAT_TAKEN"
   | "IDEMPOTENCY_KEY_REUSED"
+  | "PAYMENT_UNAVAILABLE"
+  | "INVALID_SIGNATURE"
   | "RATE_LIMITED"
   | "INTERNAL_ERROR"
   | "NETWORK_ERROR"
@@ -18,6 +21,7 @@ export type EventDto = {
   startsAt: string;
   rows: number;
   seatsPerRow: number;
+  price: number;
 };
 
 export type EventWithTakenSeats = {
@@ -34,7 +38,21 @@ export type ReservationInput = {
 
 export type ReservationResult = {
   reservationId: string;
+  amount: number;
   expiresAt: string;
+};
+
+export type ReservationStatus = "held" | "paid" | "expired";
+
+export type ReservationState = {
+  status: ReservationStatus;
+  amount: number;
+  expiresAt: string;
+  code?: string;
+};
+
+export type CheckoutResult = {
+  url: string;
 };
 
 export type PurchaseResult = {
@@ -96,8 +114,11 @@ function toErrorCode(value: unknown): ApiErrorCode {
     "EVENT_NOT_FOUND",
     "RESERVATION_NOT_FOUND",
     "RESERVATION_EXPIRED",
+    "RESERVATION_ALREADY_PAID",
     "SEAT_TAKEN",
     "IDEMPOTENCY_KEY_REUSED",
+    "PAYMENT_UNAVAILABLE",
+    "INVALID_SIGNATURE",
     "RATE_LIMITED",
     "INTERNAL_ERROR",
   ];
@@ -257,6 +278,7 @@ export async function createReservation(
 ): Promise<ReservationResult> {
   const payload = await requestJson<{
     reservationId?: unknown;
+    amount?: unknown;
     expiresAt?: unknown;
   }>("/api/reservations", {
     method: "POST",
@@ -270,6 +292,7 @@ export async function createReservation(
   if (
     !isRecord(payload) ||
     typeof payload.reservationId !== "string" ||
+    typeof payload.amount !== "number" ||
     typeof payload.expiresAt !== "string"
   ) {
     throw new ApiError(
@@ -281,8 +304,62 @@ export async function createReservation(
 
   return {
     reservationId: payload.reservationId,
+    amount: payload.amount,
     expiresAt: payload.expiresAt,
   };
+}
+
+export async function getReservation(
+  reservationId: string,
+): Promise<ReservationState> {
+  const payload = await requestJson<{
+    status?: unknown;
+    amount?: unknown;
+    expiresAt?: unknown;
+    code?: unknown;
+  }>(`/api/reservations/${encodeURIComponent(reservationId)}`);
+
+  if (
+    !isRecord(payload) ||
+    (payload.status !== "held" &&
+      payload.status !== "paid" &&
+      payload.status !== "expired") ||
+    typeof payload.amount !== "number" ||
+    typeof payload.expiresAt !== "string" ||
+    (payload.code !== undefined && typeof payload.code !== "string")
+  ) {
+    throw new ApiError(
+      200,
+      "INVALID_RESPONSE",
+      "Serwer nie zwrócił stanu rezerwacji.",
+    );
+  }
+
+  return {
+    status: payload.status,
+    amount: payload.amount,
+    expiresAt: payload.expiresAt,
+    ...(typeof payload.code === "string" ? { code: payload.code } : {}),
+  };
+}
+
+export async function startCheckout(
+  reservationId: string,
+): Promise<CheckoutResult> {
+  const payload = await requestJson<{ url?: unknown }>(
+    `/api/reservations/${encodeURIComponent(reservationId)}/checkout`,
+    { method: "POST" },
+  );
+
+  if (!isRecord(payload) || typeof payload.url !== "string") {
+    throw new ApiError(
+      200,
+      "INVALID_RESPONSE",
+      "Serwer nie zwrócił adresu płatności.",
+    );
+  }
+
+  return { url: payload.url };
 }
 
 export async function purchaseReservation(

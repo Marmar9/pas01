@@ -55,6 +55,19 @@ export function formatEventWeekday(iso: string): string {
   return date ? weekdayFormatter.format(date) : "Termin wkrótce";
 }
 
+export function formatPrice(grosze: number): string {
+  if (!Number.isFinite(grosze) || grosze < 0) {
+    return "—";
+  }
+
+  const zloty = Math.floor(grosze / 100);
+  const cents = Math.round(grosze % 100);
+
+  return cents === 0
+    ? `${zloty} zł`
+    : `${zloty},${String(cents).padStart(2, "0")} zł`;
+}
+
 export function formatRetryAfter(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) {
     return "spróbuj ponownie za chwilę";

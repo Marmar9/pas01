@@ -6,9 +6,11 @@ import {
   ApiError,
   createReservation,
   type EventDto,
-  purchaseReservation,
+  getReservation,
+  startCheckout,
 } from "@/lib/client-api";
-import { formatCountdown, formatEventDate } from "@/lib/format";
+import { formatCountdown, formatEventDate, formatPrice } from "@/lib/format";
+import { storeReservationMeta } from "@/lib/reservation-meta";
 
 type ReserveFormProps = {
   event: EventDto;
@@ -19,6 +21,7 @@ type FieldErrors = { customerName?: string; email?: string };
 
 type Hold = {
   reservationId: string;
+  amount: number;
   expiresAt: number;
 };
 
@@ -105,14 +108,14 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
     return errors;
   }
 
-  async function completePurchase(activeHold: Hold) {
-    const purchase = await purchaseReservation(activeHold.reservationId);
+  async function startPayment(activeHold: Hold) {
+    const checkout = await startCheckout(activeHold.reservationId);
 
-    router.push(
-      `/reservations/${encodeURIComponent(purchase.code)}?eventId=${encodeURIComponent(
-        event.id,
-      )}&seatId=${encodeURIComponent(seatId)}`,
-    );
+    storeReservationMeta(activeHold.reservationId, {
+      eventId: event.id,
+      seatId,
+    });
+    window.location.assign(checkout.url);
   }
 
   async function createHold() {
@@ -132,7 +135,11 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
 
     const expiresAt = Date.parse(reservation.expiresAt);
 
-    if (!Number.isFinite(expiresAt)) {
+    if (
+      !Number.isFinite(expiresAt) ||
+      !Number.isFinite(reservation.amount) ||
+      reservation.amount <= 0
+    ) {
       throw new ApiError(
         200,
         "INVALID_RESPONSE",
@@ -146,7 +153,11 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
       return;
     }
 
-    const nextHold = { reservationId: reservation.reservationId, expiresAt };
+    const nextHold = {
+      reservationId: reservation.reservationId,
+      amount: reservation.amount,
+      expiresAt,
+    };
     setHold(nextHold);
     setRemainingMs(expiresAt - Date.now());
   }
@@ -163,7 +174,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
     if (hold) {
       setPending(true);
       try {
-        await completePurchase(hold);
+        await startPayment(hold);
       } catch (error) {
         handleError(error);
       } finally {
@@ -253,6 +264,30 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
         setExpired(true);
         setFormError(null);
         break;
+      case "RESERVATION_ALREADY_PAID":
+        setFormError("Ta rezerwacja jest już opłacona. Otwieramy bilet…");
+
+        if (hold) {
+          void getReservation(hold.reservationId)
+            .then((reservation) => {
+              if (reservation.code) {
+                router.push(
+                  `/reservations/${encodeURIComponent(reservation.code)}`,
+                );
+              }
+            })
+            .catch(() => {
+              setFormError(
+                "Ta rezerwacja jest już opłacona. Odśwież stronę, aby zobaczyć bilet.",
+              );
+            });
+        }
+        break;
+      case "PAYMENT_UNAVAILABLE":
+        setFormError(
+          "Płatności online są chwilowo niedostępne. Spróbuj ponownie za chwilę.",
+        );
+        break;
       case "RESERVATION_NOT_FOUND":
         setHold(null);
         idempotencyKey.current = crypto.randomUUID();
@@ -276,7 +311,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
       <div className="surface-card p-6 sm:p-8">
         <p className="eyebrow text-secondary">Twoja rezerwacja</p>
         <h2 className="mt-3 text-2xl font-black text-white">{event.title}</h2>
-        <dl className="mt-6 grid gap-4 text-sm sm:grid-cols-3">
+        <dl className="mt-6 grid gap-4 text-sm sm:grid-cols-2">
           <div>
             <dt className="text-xs uppercase tracking-[0.2em] text-zinc-500">
               Termin
@@ -297,6 +332,14 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
             </dt>
             <dd className="mt-1 font-semibold text-secondary">{seatId}</dd>
           </div>
+          <div>
+            <dt className="text-xs uppercase tracking-[0.2em] text-zinc-500">
+              Cena
+            </dt>
+            <dd className="mt-1 font-semibold text-secondary">
+              {formatPrice(hold?.amount ?? event.price)}
+            </dd>
+          </div>
         </dl>
 
         {hold ? (
@@ -308,7 +351,8 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
             <span className="font-mono text-base font-bold text-secondary">
               {formatCountdown(remainingMs)}
             </span>
-            . Kliknij „Kup bilet”, aby sfinalizować rezerwację.
+            . Kliknij „Zapłać {formatPrice(hold.amount)}”, aby przejść do
+            płatności Stripe.
           </p>
         ) : null}
       </div>
@@ -411,8 +455,8 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
             ) : null}
             <p className="mt-2 text-xs text-zinc-500">
               {hold
-                ? "Dane są zablokowane do czasu zakończenia rezerwacji."
-                : "Kod rezerwacji wyślemy na ten adres."}
+                ? "Dane są zablokowane do czasu zakończenia płatności."
+                : "Po opłaceniu zobaczysz bilet z kodem na ekranie."}
             </p>
           </div>
 
@@ -445,14 +489,14 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
           >
             {pending ? (
               hold ? (
-                "Kupujemy bilet…"
+                "Przekierowujemy do płatności…"
               ) : (
                 "Blokujemy miejsce…"
               )
             ) : locked ? (
               `Poczekaj ${secondsLeft} s`
             ) : hold ? (
-              "Kup bilet"
+              `Zapłać ${formatPrice(hold.amount)}`
             ) : (
               <>
                 Zarezerwuj miejsce

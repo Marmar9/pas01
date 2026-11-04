@@ -4,7 +4,9 @@ import {
   createReservation,
   getEvent,
   getEvents,
+  getReservation,
   purchaseReservation,
+  startCheckout,
 } from "@/lib/client-api";
 
 const originalFetch = globalThis.fetch;
@@ -52,6 +54,7 @@ describe("client api", () => {
       return jsonResponse(
         {
           reservationId: "res-1",
+          amount: 3200,
           expiresAt: "2026-10-28T12:15:00.000Z",
         },
         201,
@@ -62,6 +65,7 @@ describe("client api", () => {
 
     expect(result).toEqual({
       reservationId: "res-1",
+      amount: 3200,
       expiresAt: "2026-10-28T12:15:00.000Z",
     });
     expect(calls).toBe(4);
@@ -194,5 +198,83 @@ describe("client api", () => {
 
     expect(result.event.id).toBe("event-dune");
     expect(result.takenSeats).toEqual(["A2"]);
+  });
+
+  test("reads a reservation state", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("/api/reservations/res-1");
+
+      return jsonResponse({
+        status: "paid",
+        amount: 3200,
+        expiresAt: "2026-10-28T12:15:00.000Z",
+        code: "ABC12345",
+      });
+    }) as typeof fetch;
+
+    const result = await getReservation("res-1");
+
+    expect(result).toEqual({
+      status: "paid",
+      amount: 3200,
+      expiresAt: "2026-10-28T12:15:00.000Z",
+      code: "ABC12345",
+    });
+  });
+
+  test("keeps a held reservation without a code", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({
+        status: "held",
+        amount: 3200,
+        expiresAt: "2026-10-28T12:15:00.000Z",
+      })) as typeof fetch;
+
+    const result = await getReservation("res-1");
+
+    expect(result.code).toBeUndefined();
+  });
+
+  test("rejects malformed reservation states", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({ status: "unknown", amount: 3200 })) as typeof fetch;
+
+    const error = await getReservation("res-1").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.code).toBe("INVALID_RESPONSE");
+  });
+
+  test("starts a checkout session and returns the Stripe url", async () => {
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      expect(String(input)).toBe("/api/reservations/res-1/checkout");
+      expect(init?.method).toBe("POST");
+
+      return jsonResponse({ url: "https://checkout.stripe.com/cs_test_1" });
+    }) as typeof fetch;
+
+    const result = await startCheckout("res-1");
+
+    expect(result).toEqual({ url: "https://checkout.stripe.com/cs_test_1" });
+  });
+
+  test("exposes checkout refusals", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        {
+          error: "Online payments are temporarily unavailable.",
+          code: "PAYMENT_UNAVAILABLE",
+        },
+        503,
+      )) as typeof fetch;
+
+    const error = await startCheckout("res-1").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(503);
+    expect(error.code).toBe("PAYMENT_UNAVAILABLE");
   });
 });

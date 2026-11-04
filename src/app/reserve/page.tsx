@@ -37,8 +37,8 @@ export default function ReservePage() {
             Zarezerwuj fotel
           </h1>
           <p className="mt-4 text-sm text-zinc-400">
-            Podaj dane, a my przypiszemy miejsce do Twojej rezerwacji i
-            wygenerujemy kod odbioru.
+            Podaj dane, zablokuj miejsce i opłać bilet online. Po płatności
+            zobaczysz bilet z kodem.
           </p>
 
           <div className="mt-10">

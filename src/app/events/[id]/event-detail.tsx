@@ -6,7 +6,7 @@ import { EventPoster } from "@/components/event-poster";
 import { SeatMap } from "@/components/seat-map";
 import { StateCard } from "@/components/state-card";
 import { ApiError, type EventDto, getEvent } from "@/lib/client-api";
-import { formatEventTime, formatEventWeekday } from "@/lib/format";
+import { formatEventTime, formatEventWeekday, formatPrice } from "@/lib/format";
 import { countFreeSeats } from "@/lib/seats";
 
 type DetailState =
@@ -204,6 +204,12 @@ export function EventDetail({ eventId }: { eventId: string }) {
                   <dt className="text-zinc-500">Układ sali</dt>
                   <dd className="font-semibold text-white">
                     {state.event.rows} rzędów × {state.event.seatsPerRow} miejsc
+                  </dd>
+                </div>
+                <div className="flex items-start justify-between gap-4">
+                  <dt className="text-zinc-500">Cena miejsca</dt>
+                  <dd className="font-semibold text-secondary">
+                    {formatPrice(state.event.price)}
                   </dd>
                 </div>
               </dl>
