@@ -1,14 +1,16 @@
-import { and, eq, gt, lt, lte, ne } from "drizzle-orm";
+import { and, desc, eq, gt, lt, lte, ne } from "drizzle-orm";
 import objectHash from "object-hash";
 import type { Db } from "@/db/client";
 import {
   events,
   idempotencyKeys,
+  payments,
   type ReservationRow,
   type ReservationStatus,
   reservations,
 } from "@/db/schema";
 import { generateReservationCode } from "./reservation-code";
+import { type CheckoutGateway, STRIPE_CURRENCY } from "./stripe";
 import { isSeatInLayout, parseSeatId } from "./validation";
 
 export type CreateReservationInput = {
@@ -57,6 +59,18 @@ export type StartCheckoutResult =
         | "reservation_already_paid"
         | "payment_unavailable";
     };
+
+export type CheckoutContext = {
+  reservationId: string;
+  amount: number;
+  customerEmail: string;
+  seatId: string;
+  eventTitle: string;
+};
+
+type CheckoutPreparation =
+  | { ok: true; context: CheckoutContext; existingUrl: string | null }
+  | Exclude<StartCheckoutResult, { ok: true }>;
 
 const PRODUCTION_HOLD_TTL_MS = 15 * 60 * 1000;
 const DEVELOPMENT_HOLD_TTL_MS = 2 * 60 * 1000;
@@ -366,10 +380,35 @@ export function getReservationState(
   );
 }
 
-export function startCheckout(
-  db: Db,
-  reservationId: string,
-): StartCheckoutResult {
+export type PaidTicket = {
+  code: string;
+  eventId: string;
+  seatId: string;
+};
+
+// Ticket pages render a code only after the database confirms it belongs to a
+// paid reservation; a code in the URL alone is never trusted.
+export function getPaidTicketByCode(db: Db, code: string): PaidTicket | null {
+  const reservation = db
+    .select({
+      code: reservations.code,
+      eventId: reservations.eventId,
+      seatId: reservations.seatId,
+    })
+    .from(reservations)
+    .where(and(eq(reservations.code, code), eq(reservations.status, "paid")))
+    .get();
+
+  return reservation?.code
+    ? {
+        code: reservation.code,
+        eventId: reservation.eventId,
+        seatId: reservation.seatId,
+      }
+    : null;
+}
+
+function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
   return db.transaction(
     (tx) => {
       // Judge expiry only after BEGIN IMMEDIATE has acquired the write lock;
@@ -400,12 +439,184 @@ export function startCheckout(
         return { ok: false, reason: "reservation_expired" };
       }
 
-      // Stripe Checkout is not wired up yet. Once it is, create a Checkout
-      // Session for reservation.amount here and return its url.
+      if (reservation.amount <= 0) {
+        return { ok: false, reason: "payment_unavailable" };
+      }
+
+      const event = tx
+        .select({ title: events.title })
+        .from(events)
+        .where(eq(events.id, reservation.eventId))
+        .get();
+
+      if (!event) {
+        return { ok: false, reason: "payment_unavailable" };
+      }
+
+      // A pending Checkout Session stays valid much longer than the hold, so
+      // retries can reuse it instead of opening another payment attempt.
+      const pendingPayment = tx
+        .select({ checkoutUrl: payments.checkoutUrl })
+        .from(payments)
+        .where(
+          and(
+            eq(payments.reservationId, reservationId),
+            eq(payments.status, "pending"),
+          ),
+        )
+        .orderBy(desc(payments.createdAt))
+        .get();
+
+      return {
+        ok: true,
+        context: {
+          reservationId: reservation.id,
+          amount: reservation.amount,
+          customerEmail: reservation.email,
+          seatId: reservation.seatId,
+          eventTitle: event.title,
+        },
+        existingUrl: pendingPayment?.checkoutUrl ?? null,
+      };
+    },
+    { behavior: "immediate" },
+  );
+}
+
+function recordCheckoutSession(
+  db: Db,
+  context: CheckoutContext,
+  session: { id: string; url: string | null },
+): StartCheckoutResult {
+  return db.transaction(
+    (tx) => {
+      const now = new Date();
+      const reservation = tx
+        .select()
+        .from(reservations)
+        .where(eq(reservations.id, context.reservationId))
+        .get();
+
+      if (!reservation) {
+        return { ok: false, reason: "reservation_not_found" };
+      }
+
+      if (reservation.status === "paid") {
+        return { ok: false, reason: "reservation_already_paid" };
+      }
+
+      if (
+        reservation.status === "expired" ||
+        reservation.expiresAt.getTime() <= now.getTime()
+      ) {
+        if (reservation.status !== "expired") {
+          markExpired(tx, context.reservationId);
+        }
+
+        return { ok: false, reason: "reservation_expired" };
+      }
+
+      if (!session.url) {
+        return { ok: false, reason: "payment_unavailable" };
+      }
+
+      const existing = tx
+        .select({ checkoutUrl: payments.checkoutUrl })
+        .from(payments)
+        .where(eq(payments.stripeCheckoutSessionId, session.id))
+        .get();
+
+      if (existing?.checkoutUrl) {
+        return { ok: true, url: existing.checkoutUrl };
+      }
+
+      const inserted = tx
+        .insert(payments)
+        .values({
+          id: crypto.randomUUID(),
+          reservationId: context.reservationId,
+          stripeCheckoutSessionId: session.id,
+          stripePaymentIntentId: null,
+          checkoutUrl: session.url,
+          amount: context.amount,
+          currency: STRIPE_CURRENCY,
+          status: "pending",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .onConflictDoNothing()
+        .returning({ checkoutUrl: payments.checkoutUrl })
+        .get();
+
+      if (inserted?.checkoutUrl) {
+        return { ok: true, url: inserted.checkoutUrl };
+      }
+
+      const conflict = tx
+        .select({ checkoutUrl: payments.checkoutUrl })
+        .from(payments)
+        .where(eq(payments.stripeCheckoutSessionId, session.id))
+        .get();
+
+      if (conflict?.checkoutUrl) {
+        return { ok: true, url: conflict.checkoutUrl };
+      }
+
       return { ok: false, reason: "payment_unavailable" };
     },
     { behavior: "immediate" },
   );
+}
+
+export async function startCheckout(
+  db: Db,
+  reservationId: string,
+  gateway: CheckoutGateway | null,
+): Promise<StartCheckoutResult> {
+  if (!gateway) {
+    return { ok: false, reason: "payment_unavailable" };
+  }
+
+  const prepared = prepareCheckout(db, reservationId);
+
+  if (!prepared.ok) {
+    return prepared;
+  }
+
+  if (prepared.existingUrl) {
+    return { ok: true, url: prepared.existingUrl };
+  }
+
+  let session: { id: string; url: string | null };
+
+  try {
+    session = await gateway.createCheckoutSession(prepared.context);
+  } catch (error) {
+    console.error("Failed to create Stripe Checkout Session:", error);
+    return { ok: false, reason: "payment_unavailable" };
+  }
+
+  if (!session.url) {
+    try {
+      await gateway.expireCheckoutSession(session.id);
+    } catch (error) {
+      console.error("Failed to expire unusable Stripe session:", error);
+    }
+
+    return { ok: false, reason: "payment_unavailable" };
+  }
+
+  const recorded = recordCheckoutSession(db, prepared.context, session);
+
+  if (!recorded.ok) {
+    try {
+      await gateway.expireCheckoutSession(session.id);
+    } catch (error) {
+      console.error("Failed to expire rejected Stripe session:", error);
+    }
+  }
+
+  return recorded;
 }
 
 export function purchaseReservation(
