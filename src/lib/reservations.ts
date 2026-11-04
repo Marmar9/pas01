@@ -66,6 +66,7 @@ export type CheckoutContext = {
   customerEmail: string;
   seatId: string;
   eventTitle: string;
+  idempotencyKey: string;
 };
 
 type CheckoutPreparation =
@@ -467,6 +468,15 @@ function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
         .orderBy(desc(payments.createdAt))
         .get();
 
+      // Retries and concurrent requests for the same attempt share one key,
+      // so Stripe returns the session it already created. Once an attempt is
+      // recorded and later expires or fails, the next attempt gets a new key.
+      const previousAttempts = tx
+        .select({ id: payments.id })
+        .from(payments)
+        .where(eq(payments.reservationId, reservationId))
+        .all().length;
+
       return {
         ok: true,
         context: {
@@ -475,6 +485,7 @@ function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
           customerEmail: reservation.email,
           seatId: reservation.seatId,
           eventTitle: event.title,
+          idempotencyKey: `checkout:${reservation.id}:${previousAttempts + 1}`,
         },
         existingUrl: pendingPayment?.checkoutUrl ?? null,
       };
