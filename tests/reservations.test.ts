@@ -1,14 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { events, idempotencyKeys, reservations } from "@/db/schema";
+import { events, idempotencyKeys, payments, reservations } from "@/db/schema";
 import {
   createReservation,
+  getPaidTicketByCode,
   getReservationHoldTtlMs,
   getReservationState,
   purchaseReservation,
   RESERVATION_HOLD_TTL_MS,
   startCheckout,
 } from "@/lib/reservations";
+import type { CheckoutGateway, CheckoutSessionInput } from "@/lib/stripe";
 import { createTestDb, duneEvent, seedTestEvents } from "./helpers";
 
 let keyCounter = 0;
@@ -30,6 +32,30 @@ function expireReservations(db: ReturnType<typeof createTestDb>) {
   db.update(reservations)
     .set({ expiresAt: new Date(Date.now() - 1000) })
     .run();
+}
+
+function fakeGateway(overrides: Partial<CheckoutGateway> = {}) {
+  const created: CheckoutSessionInput[] = [];
+  const expired: string[] = [];
+  let counter = 0;
+
+  const gateway: CheckoutGateway = {
+    async createCheckoutSession(input) {
+      created.push(input);
+      counter += 1;
+
+      return {
+        id: `cs_test_${counter}`,
+        url: `https://checkout.stripe.test/${counter}`,
+      };
+    },
+    async expireCheckoutSession(sessionId) {
+      expired.push(sessionId);
+    },
+    ...overrides,
+  };
+
+  return { gateway, created, expired };
 }
 
 describe("reservation hold TTL", () => {
@@ -432,72 +458,190 @@ describe("getReservationState", () => {
 });
 
 describe("startCheckout", () => {
-  test("reports an unknown reservation", () => {
+  test("reports an unknown reservation", async () => {
     const db = createTestDb();
     seedTestEvents(db);
+    const { gateway } = fakeGateway();
 
-    expect(startCheckout(db, "missing-reservation")).toEqual({
+    expect(await startCheckout(db, "missing-reservation", gateway)).toEqual({
       ok: false,
       reason: "reservation_not_found",
     });
   });
 
-  test("refuses to check out an expired hold and marks it expired", () => {
+  test("refuses to check out an expired hold and marks it expired", async () => {
     const db = createTestDb();
     seedTestEvents(db);
+    const { gateway, created } = fakeGateway();
 
-    const created = createReservation(db, reservationInput());
+    const hold = createReservation(db, reservationInput());
 
-    expect(created.ok).toBe(true);
+    expect(hold.ok).toBe(true);
 
-    if (!created.ok) {
+    if (!hold.ok) {
       return;
     }
 
     expireReservations(db);
 
-    expect(startCheckout(db, created.reservationId)).toEqual({
+    expect(await startCheckout(db, hold.reservationId, gateway)).toEqual({
       ok: false,
       reason: "reservation_expired",
     });
     expect(db.select().from(reservations).get()?.status).toBe("expired");
+    expect(created).toHaveLength(0);
   });
 
-  test("refuses to check out an already paid reservation", () => {
+  test("refuses to check out an already paid reservation", async () => {
     const db = createTestDb();
     seedTestEvents(db);
+    const { gateway, created } = fakeGateway();
 
-    const created = createReservation(db, reservationInput());
+    const hold = createReservation(db, reservationInput());
 
-    expect(created.ok).toBe(true);
+    expect(hold.ok).toBe(true);
 
-    if (!created.ok) {
+    if (!hold.ok) {
       return;
     }
 
-    expect(purchaseReservation(db, created.reservationId).ok).toBe(true);
-    expect(startCheckout(db, created.reservationId)).toEqual({
+    expect(purchaseReservation(db, hold.reservationId).ok).toBe(true);
+    expect(await startCheckout(db, hold.reservationId, gateway)).toEqual({
       ok: false,
       reason: "reservation_already_paid",
     });
+    expect(created).toHaveLength(0);
   });
 
-  test("reports payments as unavailable until Stripe is configured", () => {
+  test("reports payments as unavailable when Stripe is not configured", async () => {
     const db = createTestDb();
     seedTestEvents(db);
 
-    const created = createReservation(db, reservationInput());
+    const hold = createReservation(db, reservationInput());
 
-    expect(created.ok).toBe(true);
+    expect(hold.ok).toBe(true);
 
-    if (!created.ok) {
+    if (!hold.ok) {
       return;
     }
 
-    expect(startCheckout(db, created.reservationId)).toEqual({
+    expect(await startCheckout(db, hold.reservationId, null)).toEqual({
       ok: false,
       reason: "payment_unavailable",
     });
+  });
+
+  test("creates a Checkout Session for the captured amount", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { gateway, created } = fakeGateway();
+
+    const hold = createReservation(db, reservationInput());
+
+    expect(hold.ok).toBe(true);
+
+    if (!hold.ok) {
+      return;
+    }
+
+    expect(await startCheckout(db, hold.reservationId, gateway)).toEqual({
+      ok: true,
+      url: "https://checkout.stripe.test/1",
+    });
+    expect(created).toEqual([
+      {
+        reservationId: hold.reservationId,
+        amount: duneEvent.price,
+        customerEmail: "ada@example.com",
+        seatId: "A2",
+        eventTitle: duneEvent.title,
+      },
+    ]);
+
+    const payment = db.select().from(payments).get();
+
+    expect(payment).toMatchObject({
+      reservationId: hold.reservationId,
+      stripeCheckoutSessionId: "cs_test_1",
+      checkoutUrl: "https://checkout.stripe.test/1",
+      amount: duneEvent.price,
+      currency: "pln",
+      status: "pending",
+    });
+  });
+
+  test("reuses a pending session instead of charging twice", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { gateway, created } = fakeGateway();
+
+    const hold = createReservation(db, reservationInput());
+
+    expect(hold.ok).toBe(true);
+
+    if (!hold.ok) {
+      return;
+    }
+
+    const first = await startCheckout(db, hold.reservationId, gateway);
+    const second = await startCheckout(db, hold.reservationId, gateway);
+
+    expect(first).toEqual({ ok: true, url: "https://checkout.stripe.test/1" });
+    expect(second).toEqual(first);
+    expect(created).toHaveLength(1);
+    expect(db.select().from(payments).all()).toHaveLength(1);
+  });
+
+  test("reports payment_unavailable when Stripe fails", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { gateway } = fakeGateway({
+      async createCheckoutSession() {
+        throw new Error("Stripe is down");
+      },
+    });
+    const errorLog = spyOn(console, "error").mockImplementation(() => {});
+
+    const hold = createReservation(db, reservationInput());
+
+    expect(hold.ok).toBe(true);
+
+    if (!hold.ok) {
+      errorLog.mockRestore();
+      return;
+    }
+
+    expect(await startCheckout(db, hold.reservationId, gateway)).toEqual({
+      ok: false,
+      reason: "payment_unavailable",
+    });
+    expect(db.select().from(payments).all()).toHaveLength(0);
+    errorLog.mockRestore();
+  });
+
+  test("expires a session that has no checkout url", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { gateway, expired } = fakeGateway({
+      async createCheckoutSession() {
+        return { id: "cs_without_url", url: null };
+      },
+    });
+
+    const hold = createReservation(db, reservationInput());
+
+    expect(hold.ok).toBe(true);
+
+    if (!hold.ok) {
+      return;
+    }
+
+    expect(await startCheckout(db, hold.reservationId, gateway)).toEqual({
+      ok: false,
+      reason: "payment_unavailable",
+    });
+    expect(expired).toEqual(["cs_without_url"]);
+    expect(db.select().from(payments).all()).toHaveLength(0);
   });
 });
 
@@ -648,5 +792,43 @@ describe("purchaseReservation", () => {
       ok: true,
       code: purchased.code,
     });
+  });
+});
+
+describe("getPaidTicketByCode", () => {
+  test("returns the ticket only for a paid reservation code", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+
+    const hold = createReservation(db, reservationInput({ seatId: "C3" }));
+    expect(hold.ok).toBe(true);
+
+    if (!hold.ok) {
+      return;
+    }
+
+    db.update(reservations)
+      .set({ code: "UNPAIDCODE" })
+      .where(eq(reservations.id, hold.reservationId))
+      .run();
+    expect(getPaidTicketByCode(db, "UNPAIDCODE")).toBeNull();
+
+    db.update(reservations)
+      .set({ code: null })
+      .where(eq(reservations.id, hold.reservationId))
+      .run();
+    const purchase = purchaseReservation(db, hold.reservationId);
+    expect(purchase.ok).toBe(true);
+
+    if (!purchase.ok) {
+      return;
+    }
+
+    expect(getPaidTicketByCode(db, purchase.code)).toEqual({
+      code: purchase.code,
+      eventId: duneEvent.id,
+      seatId: "C3",
+    });
+    expect(getPaidTicketByCode(db, "NOSUCHCODE")).toBeNull();
   });
 });

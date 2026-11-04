@@ -2,6 +2,7 @@ import { getDb } from "@/db/client";
 import { errorResponse } from "@/lib/api";
 import { RATE_LIMITS, rateLimited } from "@/lib/rate-limit";
 import { startCheckout } from "@/lib/reservations";
+import { getStripeCheckoutGateway } from "@/lib/stripe";
 
 async function handler(
   _request: Request,
@@ -10,7 +11,7 @@ async function handler(
   const { id } = await context.params;
 
   try {
-    const result = startCheckout(getDb(), id);
+    const result = await startCheckout(getDb(), id, getStripeCheckoutGateway());
 
     if (!result.ok) {
       switch (result.reason) {
@@ -36,7 +37,7 @@ async function handler(
           return errorResponse(
             503,
             "PAYMENT_UNAVAILABLE",
-            "Online payments are not available yet.",
+            "Online payments are temporarily unavailable.",
           );
       }
     }

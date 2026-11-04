@@ -77,6 +77,62 @@ export const idempotencyKeys = sqliteTable(
   (table) => [index("idempotency_keys_created_at_idx").on(table.createdAt)],
 );
 
+export const PAYMENT_STATUSES = [
+  "pending",
+  "paid",
+  "failed",
+  "expired",
+] as const;
+export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
+
+export const payments = sqliteTable(
+  "payments",
+  {
+    id: text("id").primaryKey(),
+    reservationId: text("reservation_id")
+      .notNull()
+      .references(() => reservations.id, { onDelete: "cascade" }),
+    stripeCheckoutSessionId: text("stripe_checkout_session_id").notNull(),
+    stripePaymentIntentId: text("stripe_payment_intent_id"),
+    checkoutUrl: text("checkout_url"),
+    amount: integer("amount").notNull(),
+    currency: text("currency").notNull().default("pln"),
+    status: text("status").$type<PaymentStatus>().notNull().default("pending"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+  },
+  (table) => [
+    uniqueIndex("payments_checkout_session_unique").on(
+      table.stripeCheckoutSessionId,
+    ),
+    // At most one open payment attempt per reservation, so concurrent checkout
+    // requests cannot create two chargeable sessions.
+    uniqueIndex("payments_pending_reservation_unique")
+      .on(table.reservationId)
+      .where(sql`${table.status} = 'pending'`),
+    index("payments_reservation_id_idx").on(table.reservationId),
+    index("payments_status_created_at_idx").on(table.status, table.createdAt),
+    check(
+      "payments_status_check",
+      sql`${table.status} in ('pending', 'paid', 'failed', 'expired')`,
+    ),
+  ],
+);
+
+export const stripeEvents = sqliteTable("stripe_events", {
+  id: text("id").primaryKey(),
+  type: text("type").notNull(),
+  processedAt: integer("processed_at", { mode: "timestamp_ms" })
+    .notNull()
+    .default(sql`(unixepoch() * 1000)`),
+});
+
 export type EventRow = typeof events.$inferSelect;
 export type ReservationRow = typeof reservations.$inferSelect;
 export type IdempotencyKeyRow = typeof idempotencyKeys.$inferSelect;
+export type PaymentRow = typeof payments.$inferSelect;
+export type StripeEventRow = typeof stripeEvents.$inferSelect;
