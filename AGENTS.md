@@ -128,17 +128,29 @@ Checkout Session requirements:
   - cancel_url:
       ${APP_URL}/reservations/${reservationId}/payment/cancel
   - The client never supplies the price or amount.
+  - Request option idempotencyKey: checkout:${reservationId}:${attempt},
+    where attempt = 1 + number of payments already recorded for the
+    reservation. Retries and concurrent calls for the same attempt get the
+    same Stripe session back; a new attempt (after an expired/failed session)
+    gets a new key.
 
 Payment persistence:
   - Every Checkout Session attempt is recorded in a `payments` table:
     id, reservationId, stripeCheckoutSessionId (unique),
     stripePaymentIntentId, checkoutUrl, amount (copy of reservation.amount),
-    currency, status ("pending" | "paid" | "failed" | "expired"), createdAt,
-    updatedAt.
+    currency, status ("pending" | "paid" | "failed" | "expired" |
+    "refunded"), stripeRefundId, createdAt, updatedAt.
   - At most one "pending" payment per reservation (partial unique index); its
     checkoutUrl is what repeated checkout calls return.
-  - Processed webhook event ids are stored in `stripe_events` (id primary key)
-    so a duplicate delivery is a no-op.
+  - A "refunded" payment never goes back to "paid", even if a later event
+    for the same session arrives.
+  - Processed webhook event ids are stored in `stripe_events` (the inbox):
+    id (primary key), type, outcome ("processed" | "ignored" | "failed"),
+    failureReason, processedAt. A duplicate delivery is a no-op.
+  - Rows with outcome "failed" are the dead-letter record of webhook events
+    that need human review (unknown reservation, amount/currency mismatch,
+    late payment, invalid session). They are never pruned. Other rows are
+    pruned after 7 days inside the webhook transaction.
   - The webhook is the source of truth. Landing on success_url is not proof of
     payment.
 
@@ -155,7 +167,23 @@ Webhook processing (checkout.session.completed):
   - payment_status other than "paid" (async methods) is acknowledged without
     changes; checkout.session.async_payment_succeeded completes it later.
   - A payment that arrives after the hold expired is recorded as paid for
-    reconciliation, but the reservation stays expired and gets no code.
+    reconciliation, but the reservation stays expired and gets no code. In
+    the same transaction a refund job is enqueued (outbox), so the customer
+    is refunded automatically.
+  - A second paid session for a reservation that is already paid (double
+    charge) keeps the first ticket and enqueues a refund job for the second
+    payment in the same transaction. The same session reported twice (e.g.
+    completed + async_payment_succeeded) is not a double charge.
+
+Refunds (background job "refund-payment"):
+  - Job id: refund:${paymentId}; input: { paymentId }. Enqueueing the same
+    payment twice keeps one job.
+  - The worker calls stripe.refunds.create({ payment_intent, amount }) with
+    idempotencyKey = the job id, outside any database transaction, then marks
+    the payment "refunded" with its stripeRefundId and acks the job.
+  - A payment that is already "refunded" is acked without calling Stripe.
+    Stripe errors or missing Stripe configuration leave the job for a retry
+    (backoff, max 5 attempts, then dead letter).
 
 Other handled webhook events:
   - checkout.session.expired → payment "expired"
@@ -230,6 +258,9 @@ libraries: nanoid (reservation codes), object-hash (idempotency fingerprints),
 @universal-rate-limit/nextjs (sliding-window IP rate limiting),
 stripe (official Stripe Node SDK, server-side only)
 dev tools: Stripe CLI (local webhook forwarding; not an app dependency)
+background jobs: `jobs` table in the app's SQLite database; the worker polls
+it every 5 s from src/instrumentation.ts inside the Next.js server process
+(not during `next build`), so no separate process or queue service is needed.
 
 ## Code quaity
 
@@ -274,6 +305,50 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 2. GET /api/reservations/:id polling on the payment success page uses the same timeout/retry client, keeps polling until the hold expires, and renders the ticket only after status "paid".
 3. Client-side redirects to Stripe use only the { url } returned by POST /api/reservations/:id/checkout; the client never builds payment URLs itself.
 
+## Background work (E06)
+
+1. A request does only what the user must wait for (e.g. the reservation hold,
+   the Checkout URL). Slow or failure-prone side effects (mail, documents,
+   calls whose result the user does not need right away) run as background
+   jobs, so an outage of that dependency never fails the request.
+2. Background jobs live in a job table in our own SQLite database (the
+   project's queue). A job row carries: id, task, input, visibleAt (hidden
+   until then), totalTried, completedAt (set = ack), hasError (set = dead
+   letter), createdAt.
+3. A worker claims a job by moving visibleAt into the future in a write
+   transaction, does the work, and acks (completedAt) only AFTER the work
+   succeeded. Delivery is therefore at-least-once: every handler must be
+   safe to run twice.
+4. Failed jobs are retried with exponential backoff
+   (min(300 s, 2^totalTried * 5 s)). After 5 attempts the job is marked
+   hasError (dead letter queue) and left for a human; it must never block
+   other jobs.
+5. Exactly-once effects are built, not chosen: at-least-once delivery plus an
+   inbox (a table keyed by the message/event id, unique constraint) written in
+   the same transaction as the effect. A duplicate insert means "already
+   done": skip and ack.
+
+## External systems (E07)
+
+1. A database transaction covers only our database. Never call an external
+   system (Stripe, mail) inside a transaction: a rollback cannot undo it.
+2. Writing to our database and to an external system is a dual write. When an
+   external effect must follow a database change and the user is not waiting
+   for its result, record it as an outbox job (the job table above) in the
+   SAME transaction as the data change; a worker delivers it at-least-once.
+3. Every write call to Stripe passes an idempotencyKey derived from our own
+   ids (e.g. the reservation/payment/job id), identical on every retry of the
+   same operation, so a retried call returns the original result instead of
+   creating a second object.
+4. For providers without idempotency keys (e.g. plain SMTP) duplicates cannot
+   be excluded: choose at-least-once consciously and only where a duplicate is
+   cheaper than a loss.
+5. Incoming webhooks use an inbox: the Stripe event id is inserted into
+   `stripe_events` in the same transaction as the effect it causes; a
+   duplicate delivery changes nothing and still answers 2xx. Stripe retries
+   for up to 3 days, so inbox rows are kept for at least 7 days and only
+   older rows may be pruned.
+
 # Risks / threat list
 
 Stripe is an external dependency and MUST stay on this list.
@@ -283,12 +358,15 @@ Stripe is an external dependency and MUST stay on this list.
 - Webhook forgery/replay: verify Stripe-Signature on the raw body, reject invalid signatures, and deduplicate event ids.
 - Price/amount tampering: price and amount come from the database; the client never sends money fields. The webhook validates currency and amount_total against the stored amount.
 - Race between hold expiry and payment completion: use transactions and conditional updates. The partial unique index must prevent double-selling a seat.
-- Double payment / retries: one reservation may have several Checkout Session attempts, but only one paid transition and one ticket code.
+- Double payment / retries: one reservation may have several Checkout Session attempts, but only one paid transition and one ticket code. A second paid attempt is refunded automatically.
+- Late payment: a hold can expire while the customer is still on Stripe's page (sessions outlive the hold). The payment is recorded, the reservation stays expired, and the payment is refunded through the outbox.
 - User closes the browser before returning: the webhook still completes the payment, and the ticket must remain recoverable by reservation id/code.
 - SQLite single-writer contention: keep payment/transaction work short and take the write lock before decision reads.
 - Account/process risk: each team uses its own Stripe test account, adds the teacher as a read-only team member, and never uses live keys.
 - Client network failures: retry safe reads and idempotent writes only; do not blindly retry a payment confirmation.
 - Open redirect/phishing: redirect only to Stripe URLs returned by our own checkout endpoint; build return URLs server-side from APP_URL.
+- Dual write: a crash between our commit and an external call (or vice versa) leaves the two systems disagreeing. Use the outbox, idempotency keys, and the inbox as described under External systems.
+- Poison messages: a job or event that always fails must not be retried forever; cap attempts and move it to the dead letter queue for human review.
 
 # !! WARNING
 
