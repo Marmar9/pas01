@@ -1,4 +1,4 @@
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq, gt, lt, ne } from "drizzle-orm";
 import type Stripe from "stripe";
 import type { Db } from "@/db/client";
 import {
@@ -6,8 +6,10 @@ import {
   payments,
   type ReservationRow,
   reservations,
+  type StripeEventOutcome,
   stripeEvents,
 } from "@/db/schema";
+import { enqueueRefund } from "./refunds";
 import { generateReservationCode } from "./reservation-code";
 import { STRIPE_CURRENCY } from "./stripe";
 
@@ -32,6 +34,8 @@ export type ProcessStripeEventResult =
     };
 
 const MAX_CODE_ATTEMPTS = 5;
+// Stripe retries a webhook for up to 3 days; keep inbox ids well beyond that.
+const INBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 type SqliteConstraintError = {
   code: string;
@@ -94,7 +98,7 @@ function upsertPaidPayment(
   tx: Db,
   session: Stripe.Checkout.Session,
   reservation: ReservationRow,
-): void {
+): string {
   const now = new Date();
   const existing = tx
     .select({ id: payments.id })
@@ -103,6 +107,8 @@ function upsertPaidPayment(
     .get();
 
   if (existing) {
+    // A refunded payment must not flip back to paid on a late or repeated
+    // event for the same session.
     tx.update(payments)
       .set({
         status: "paid",
@@ -111,15 +117,17 @@ function upsertPaidPayment(
         stripePaymentIntentId: getPaymentIntentId(session),
         updatedAt: now,
       })
-      .where(eq(payments.id, existing.id))
+      .where(and(eq(payments.id, existing.id), ne(payments.status, "refunded")))
       .run();
 
-    return;
+    return existing.id;
   }
+
+  const id = crypto.randomUUID();
 
   tx.insert(payments)
     .values({
-      id: crypto.randomUUID(),
+      id,
       reservationId: reservation.id,
       stripeCheckoutSessionId: session.id,
       stripePaymentIntentId: getPaymentIntentId(session),
@@ -130,8 +138,29 @@ function upsertPaidPayment(
       createdAt: now,
       updatedAt: now,
     })
-    .onConflictDoNothing()
     .run();
+
+  return id;
+}
+
+function hasOtherPaidPayment(
+  tx: Db,
+  reservationId: string,
+  paymentId: string,
+): boolean {
+  return Boolean(
+    tx
+      .select({ id: payments.id })
+      .from(payments)
+      .where(
+        and(
+          eq(payments.reservationId, reservationId),
+          eq(payments.status, "paid"),
+          ne(payments.id, paymentId),
+        ),
+      )
+      .get(),
+  );
 }
 
 function issueCodeForPaidReservation(
@@ -215,7 +244,14 @@ function applyPaidSession(
   }
 
   if (reservation.status === "paid") {
-    upsertPaidPayment(tx, session, reservation);
+    const paymentId = upsertPaidPayment(tx, session, reservation);
+
+    // A second paid session for an already paid reservation is a double
+    // charge: keep the first ticket and refund this payment.
+    if (hasOtherPaidPayment(tx, reservationId, paymentId)) {
+      enqueueRefund(tx, paymentId);
+    }
+
     return { ok: true };
   }
 
@@ -239,7 +275,9 @@ function applyPaidSession(
 
     // Keep the successful payment for audit/reconciliation, but do not turn an
     // expired hold into a ticket because its seat may already be re-held.
-    upsertPaidPayment(tx, session, reservation);
+    // The customer was charged without a ticket, so refund via the outbox.
+    const paymentId = upsertPaidPayment(tx, session, reservation);
+    enqueueRefund(tx, paymentId);
 
     return { ok: false, reason: "reservation_expired", permanent: true };
   }
@@ -255,15 +293,83 @@ function applyPaidSession(
   return { ok: true };
 }
 
+function handleStripeEvent(
+  tx: Db,
+  event: StripeEventLike,
+): ProcessStripeEventResult {
+  if (
+    event.type === "checkout.session.expired" ||
+    event.type === "checkout.session.async_payment_failed"
+  ) {
+    const session = asCheckoutSession(event.data.object);
+
+    if (!session) {
+      return { ok: false, reason: "invalid_session", permanent: true };
+    }
+
+    updatePaymentStatus(
+      tx,
+      session.id,
+      event.type === "checkout.session.expired" ? "expired" : "failed",
+    );
+
+    return { ok: true };
+  }
+
+  if (
+    event.type !== "checkout.session.completed" &&
+    event.type !== "checkout.session.async_payment_succeeded"
+  ) {
+    return { ok: true, ignored: true };
+  }
+
+  const session = asCheckoutSession(event.data.object);
+
+  if (!session) {
+    return { ok: false, reason: "invalid_session", permanent: true };
+  }
+
+  // `completed` can be emitted before an asynchronous payment settles.
+  // The async_payment_succeeded event will finish the reservation later.
+  if (session.payment_status !== "paid") {
+    return { ok: true, ignored: true };
+  }
+
+  return applyPaidSession(tx, session);
+}
+
+function toOutcome(result: ProcessStripeEventResult): StripeEventOutcome {
+  if (!result.ok) {
+    return "failed";
+  }
+
+  return result.ignored ? "ignored" : "processed";
+}
+
 export function processStripeEvent(
   db: Db,
   event: StripeEventLike,
+  now = new Date(),
 ): ProcessStripeEventResult {
   return db.transaction(
     (tx) => {
+      // Failed events are the dead-letter record for human review, so only
+      // handled ones are pruned.
+      tx.delete(stripeEvents)
+        .where(
+          and(
+            lt(
+              stripeEvents.processedAt,
+              new Date(now.getTime() - INBOX_RETENTION_MS),
+            ),
+            ne(stripeEvents.outcome, "failed"),
+          ),
+        )
+        .run();
+
       const inserted = tx
         .insert(stripeEvents)
-        .values({ id: event.id, type: event.type })
+        .values({ id: event.id, type: event.type, processedAt: now })
         .onConflictDoNothing()
         .returning({ id: stripeEvents.id })
         .get();
@@ -272,45 +378,17 @@ export function processStripeEvent(
         return { ok: true, duplicate: true };
       }
 
-      if (
-        event.type === "checkout.session.expired" ||
-        event.type === "checkout.session.async_payment_failed"
-      ) {
-        const session = asCheckoutSession(event.data.object);
+      const result = handleStripeEvent(tx, event);
 
-        if (!session) {
-          return { ok: false, reason: "invalid_session", permanent: true };
-        }
+      tx.update(stripeEvents)
+        .set({
+          outcome: toOutcome(result),
+          failureReason: result.ok ? null : result.reason,
+        })
+        .where(eq(stripeEvents.id, event.id))
+        .run();
 
-        updatePaymentStatus(
-          tx,
-          session.id,
-          event.type === "checkout.session.expired" ? "expired" : "failed",
-        );
-
-        return { ok: true };
-      }
-
-      if (
-        event.type !== "checkout.session.completed" &&
-        event.type !== "checkout.session.async_payment_succeeded"
-      ) {
-        return { ok: true, ignored: true };
-      }
-
-      const session = asCheckoutSession(event.data.object);
-
-      if (!session) {
-        return { ok: false, reason: "invalid_session", permanent: true };
-      }
-
-      // `completed` can be emitted before an asynchronous payment settles.
-      // The async_payment_succeeded event will finish the reservation later.
-      if (session.payment_status !== "paid") {
-        return { ok: true, ignored: true };
-      }
-
-      return applyPaidSession(tx, session);
+      return result;
     },
     { behavior: "immediate" },
   );

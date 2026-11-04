@@ -168,9 +168,24 @@ legitimate Stripe bursts are not dropped. They are enforced by
 
 Every Checkout Session attempt is recorded in the `payments` table with the
 Stripe session id, payment intent id, captured amount, currency and status
-(`pending`, `paid`, `failed`, `expired`). Processed webhook event ids are stored
-in `stripe_events` with a unique constraint, so duplicate deliveries are
-no-ops.
+(`pending`, `paid`, `failed`, `expired`, `refunded`). Processed webhook event
+ids are stored in `stripe_events` with a unique constraint, so duplicate
+deliveries are no-ops. Each event row records its outcome; `failed` rows
+(amount mismatch, unknown reservation, late payment, …) are kept for review,
+the rest are pruned after 7 days.
+
+### Background jobs and refunds
+
+If a customer pays after their hold expired, or pays twice for the same
+reservation, the webhook enqueues a `refund-payment` job in the `jobs` table
+in the same transaction. A worker started from `src/instrumentation.ts` polls
+the table every 5 seconds inside the Next.js server, refunds the payment
+through Stripe (idempotency key = job id), and marks it `refunded`. Failed jobs
+are retried with exponential backoff; after 5 attempts they stay in the table
+with `has_error = 1` for manual review.
+
+After pulling these changes run `bun run db:migrate` to create the `jobs`
+table and the new columns.
 
 Reservation codes are generated with `nanoid` at payment confirmation time, and
 idempotency request fingerprints use `object-hash` (SHA-256).

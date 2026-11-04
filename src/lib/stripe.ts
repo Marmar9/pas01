@@ -111,3 +111,31 @@ export function getStripeCheckoutGateway(): CheckoutGateway | null {
   return stripe ? createStripeCheckoutGateway(stripe) : null;
 }
 
+export type RefundInput = {
+  paymentIntentId: string;
+  amount: number;
+  idempotencyKey: string;
+};
+
+export type RefundGateway = {
+  refundPayment(input: RefundInput): Promise<{ id: string }>;
+};
+
+export function createStripeRefundGateway(stripe: Stripe): RefundGateway {
+  return {
+    async refundPayment(input) {
+      const refund = await stripe.refunds.create(
+        { payment_intent: input.paymentIntentId, amount: input.amount },
+        { idempotencyKey: input.idempotencyKey },
+      );
+
+      return { id: refund.id };
+    },
+  };
+}
+
+export function getStripeRefundGateway(): RefundGateway | null {
+  const stripe = getStripeClient();
+
+  return stripe ? createStripeRefundGateway(stripe) : null;
+}
