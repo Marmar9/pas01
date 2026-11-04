@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:stripe": "bun run --parallel dev stripe:listen",
+    "stripe:listen": "bun run scripts/stripe-listen.ts",
     "build": "next build",
     "start": "next start",
     "lint": "biome check",
