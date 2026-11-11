@@ -23,7 +23,7 @@ type PaymentState =
   | { status: "loading" }
   | { status: "pending"; reservation: ReservationState }
   | { status: "paid"; reservation: PaidReservation }
-  | { status: "expired"; amount: number }
+  | { status: "expired"; amount: number; pointsUsed: number }
   | { status: "not-found" }
   | { status: "error"; message: string };
 
@@ -36,6 +36,7 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
   const pollTimer = useRef<number | null>(null);
   const knownExpiry = useRef<number | null>(null);
   const knownAmount = useRef<number | null>(null);
+  const knownPoints = useRef<number>(0);
 
   const check = useCallback(async () => {
     if (pollTimer.current !== null) {
@@ -70,12 +71,17 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
         !Number.isFinite(expiresAt) ||
         expiresAt <= Date.now()
       ) {
-        setState({ status: "expired", amount: reservation.amount });
+        setState({
+          status: "expired",
+          amount: reservation.amount,
+          pointsUsed: reservation.pointsUsed,
+        });
         return;
       }
 
       knownExpiry.current = expiresAt;
       knownAmount.current = reservation.amount;
+      knownPoints.current = reservation.pointsUsed;
       setState({ status: "pending", reservation });
       pollTimer.current = window.setTimeout(() => {
         void check();
@@ -89,7 +95,11 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
       const expiry = knownExpiry.current;
 
       if (expiry !== null && expiry <= Date.now()) {
-        setState({ status: "expired", amount: knownAmount.current ?? 0 });
+        setState({
+          status: "expired",
+          amount: knownAmount.current ?? 0,
+          pointsUsed: knownPoints.current,
+        });
         return;
       }
 
@@ -198,7 +208,7 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
           icon="warning"
           title="Rezerwacja wygasła"
           description={`Nie potwierdziliśmy płatności ${formatPrice(
-            state.amount,
+            cardAmountFor(state.amount, state.pointsUsed),
           )} przed upływem ważności rezerwacji. Miejsce zostało zwolnione.`}
           action={
             <Link href="/" className="btn-primary">
