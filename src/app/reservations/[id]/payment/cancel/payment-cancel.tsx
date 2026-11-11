@@ -110,7 +110,7 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
     }
   }, [state, now]);
 
-  async function payAgain() {
+  async function payAgain(cardOnly = false) {
     if (state.status !== "held" || pending) {
       return;
     }
@@ -122,7 +122,7 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
     try {
       const checkout = await startCheckout(
         reservationId,
-        lockedPoints > 0 ? lockedPoints : undefined,
+        cardOnly ? 0 : lockedPoints > 0 ? lockedPoints : undefined,
       );
       window.location.assign(checkout.url);
     } catch (error) {
@@ -158,7 +158,14 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
         if (error.code === "LOYALTY_UNAVAILABLE") {
           await load();
           setNotice(
-            "Program lojalnościowy jest chwilowo niedostępny. Spróbuj ponownie, aby zapłacić kartą.",
+            "Program lojalnościowy jest chwilowo niedostępny. Możesz zapłacić kartą bez punktów.",
+          );
+          return;
+        }
+
+        if (error.code === "CHECKOUT_IN_PROGRESS") {
+          setNotice(
+            "Trwa już płatność z innym podziałem punktów. Dokończ ją lub poczekaj, aż wygaśnie.",
           );
           return;
         }
@@ -228,6 +235,16 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
                   ? "Przekierowujemy…"
                   : `Zapłać ${formatPrice(cardAmount)}`}
               </button>
+              {state.reservation.pointsUsed > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => void payAgain(true)}
+                  disabled={pending}
+                  className="btn-ghost justify-center disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Zapłać kartą bez punktów
+                </button>
+              ) : null}
               <Link href="/" className="btn-ghost">
                 Wróć do repertuaru
               </Link>
