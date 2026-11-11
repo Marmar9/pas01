@@ -1,7 +1,8 @@
-import { and, eq, gt, lt, ne } from "drizzle-orm";
+import { and, eq, gt, isNull, lt, ne } from "drizzle-orm";
 import type Stripe from "stripe";
 import type { Db } from "@/db/client";
 import {
+  loyaltyOperations,
   type PaymentStatus,
   payments,
   type ReservationRow,
@@ -9,9 +10,17 @@ import {
   type StripeEventOutcome,
   stripeEvents,
 } from "@/db/schema";
+import { expireHold } from "./holds";
+import {
+  enqueueCreditPoints,
+  pointsEarnedFor,
+  releasePaymentPoints,
+  spendSourceId,
+} from "./loyalty";
 import { enqueueRefund } from "./refunds";
 import { generateReservationCode } from "./reservation-code";
 import { STRIPE_CURRENCY } from "./stripe";
+import { enqueueTicketEmail } from "./ticket-email";
 
 export type StripeEventLike = {
   id: string;
@@ -76,14 +85,15 @@ function getPaymentIntentId(session: Stripe.Checkout.Session): string | null {
   return session.payment_intent?.id ?? null;
 }
 
-function updatePaymentStatus(
+function endPendingPayment(
   tx: Db,
   sessionId: string,
   status: PaymentStatus,
 ): void {
   // Never regress a paid attempt if Stripe delivers an old terminal event
   // out of order.
-  tx.update(payments)
+  const ended = tx
+    .update(payments)
     .set({ status, updatedAt: new Date() })
     .where(
       and(
@@ -91,14 +101,42 @@ function updatePaymentStatus(
         eq(payments.status, "pending"),
       ),
     )
-    .run();
+    .returning()
+    .get();
+
+  if (ended) {
+    releasePaymentPoints(tx, ended);
+  }
+}
+
+// The points split the session was created with. If a crash during checkout
+// left no payment row, the spend operation keyed by the session id has it.
+function sessionPointsUsed(tx: Db, sessionId: string): number {
+  const payment = tx
+    .select({ pointsUsed: payments.pointsUsed })
+    .from(payments)
+    .where(eq(payments.stripeCheckoutSessionId, sessionId))
+    .get();
+
+  if (payment) {
+    return payment.pointsUsed;
+  }
+
+  const spend = tx
+    .select({ points: loyaltyOperations.points })
+    .from(loyaltyOperations)
+    .where(eq(loyaltyOperations.id, spendSourceId(sessionId)))
+    .get();
+
+  return spend?.points ?? 0;
 }
 
 function upsertPaidPayment(
   tx: Db,
   session: Stripe.Checkout.Session,
   reservation: ReservationRow,
-): string {
+  pointsUsed: number,
+): { id: string; reservationId: string; pointsUsed: number } {
   const now = new Date();
   const existing = tx
     .select({ id: payments.id })
@@ -120,7 +158,7 @@ function upsertPaidPayment(
       .where(and(eq(payments.id, existing.id), ne(payments.status, "refunded")))
       .run();
 
-    return existing.id;
+    return { id: existing.id, reservationId: reservation.id, pointsUsed };
   }
 
   const id = crypto.randomUUID();
@@ -132,7 +170,8 @@ function upsertPaidPayment(
       stripeCheckoutSessionId: session.id,
       stripePaymentIntentId: getPaymentIntentId(session),
       checkoutUrl: session.url,
-      amount: session.amount_total ?? reservation.amount,
+      amount: session.amount_total ?? reservation.amount - pointsUsed,
+      pointsUsed,
       currency: session.currency ?? STRIPE_CURRENCY,
       status: "paid",
       createdAt: now,
@@ -140,7 +179,7 @@ function upsertPaidPayment(
     })
     .run();
 
-  return id;
+  return { id, reservationId: reservation.id, pointsUsed };
 }
 
 function hasOtherPaidPayment(
@@ -239,17 +278,22 @@ function applyPaidSession(
     return { ok: false, reason: "currency_mismatch", permanent: true };
   }
 
-  if (session.amount_total !== reservation.amount) {
+  const pointsUsed = sessionPointsUsed(tx, session.id);
+  const cardAmount = reservation.amount - pointsUsed;
+
+  if (session.amount_total !== cardAmount) {
     return { ok: false, reason: "amount_mismatch", permanent: true };
   }
 
   if (reservation.status === "paid") {
-    const paymentId = upsertPaidPayment(tx, session, reservation);
+    const payment = upsertPaidPayment(tx, session, reservation, pointsUsed);
 
     // A second paid session for an already paid reservation is a double
-    // charge: keep the first ticket and refund this payment.
-    if (hasOtherPaidPayment(tx, reservationId, paymentId)) {
-      enqueueRefund(tx, paymentId);
+    // charge: keep the first ticket, refund this payment and restore its
+    // points. It earns no points.
+    if (hasOtherPaidPayment(tx, reservationId, payment.id)) {
+      enqueueRefund(tx, payment.id);
+      releasePaymentPoints(tx, payment);
     }
 
     return { ok: true };
@@ -262,22 +306,16 @@ function applyPaidSession(
     reservation.expiresAt.getTime() <= now.getTime()
   ) {
     if (reservation.status !== "expired") {
-      tx.update(reservations)
-        .set({ status: "expired" })
-        .where(
-          and(
-            eq(reservations.id, reservationId),
-            eq(reservations.status, "held"),
-          ),
-        )
-        .run();
+      expireHold(tx, reservationId, now);
     }
 
     // Keep the successful payment for audit/reconciliation, but do not turn an
     // expired hold into a ticket because its seat may already be re-held.
-    // The customer was charged without a ticket, so refund via the outbox.
-    const paymentId = upsertPaidPayment(tx, session, reservation);
-    enqueueRefund(tx, paymentId);
+    // The customer was charged without a ticket, so refund via the outbox
+    // and restore the points of this payment. It earns no points.
+    const payment = upsertPaidPayment(tx, session, reservation, pointsUsed);
+    enqueueRefund(tx, payment.id);
+    releasePaymentPoints(tx, payment, now);
 
     return { ok: false, reason: "reservation_expired", permanent: true };
   }
@@ -288,7 +326,29 @@ function applyPaidSession(
     return { ok: false, reason: "code_generation_failed", permanent: true };
   }
 
-  upsertPaidPayment(tx, session, reservation);
+  upsertPaidPayment(tx, session, reservation, pointsUsed);
+
+  // Only the part paid by card earns points.
+  const pointsEarned = pointsEarnedFor(cardAmount);
+  const firstPaid = tx
+    .update(reservations)
+    .set({ pointsUsed, pointsEarned })
+    .where(
+      and(
+        eq(reservations.id, reservationId),
+        isNull(reservations.pointsEarned),
+      ),
+    )
+    .returning({ id: reservations.id })
+    .get();
+
+  if (firstPaid) {
+    if (pointsEarned > 0) {
+      enqueueCreditPoints(tx, reservationId, now);
+    }
+
+    enqueueTicketEmail(tx, reservationId, now);
+  }
 
   return { ok: true };
 }
@@ -307,7 +367,7 @@ function handleStripeEvent(
       return { ok: false, reason: "invalid_session", permanent: true };
     }
 
-    updatePaymentStatus(
+    endPendingPayment(
       tx,
       session.id,
       event.type === "checkout.session.expired" ? "expired" : "failed",

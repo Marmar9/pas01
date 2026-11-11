@@ -36,6 +36,10 @@ export const reservations = sqliteTable(
     code: text("code"),
     // Price captured at reservation time, in grosze.
     amount: integer("amount").notNull().default(0),
+    // Points spent on the current/locked checkout attempt (1 point = 1 grosz).
+    pointsUsed: integer("points_used").notNull().default(0),
+    // Set exactly once, when the webhook marks the reservation paid.
+    pointsEarned: integer("points_earned"),
     status: text("status").$type<ReservationStatus>().notNull().default("held"),
     expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
     purchasedAt: integer("purchased_at", { mode: "timestamp_ms" }),
@@ -96,7 +100,10 @@ export const payments = sqliteTable(
     stripeCheckoutSessionId: text("stripe_checkout_session_id").notNull(),
     stripePaymentIntentId: text("stripe_payment_intent_id"),
     checkoutUrl: text("checkout_url"),
+    // Card amount of this session: reservation.amount - pointsUsed.
     amount: integer("amount").notNull(),
+    // Points reserved for this specific Checkout Session.
+    pointsUsed: integer("points_used").notNull().default(0),
     currency: text("currency").notNull().default("pln"),
     status: text("status").$type<PaymentStatus>().notNull().default("pending"),
     stripeRefundId: text("stripe_refund_id"),
@@ -160,7 +167,61 @@ export const stripeEvents = sqliteTable(
   ],
 );
 
-export const JOB_TASKS = ["refund-payment"] as const;
+export const LOYALTY_OPERATION_TYPES = ["spend", "earn", "restore"] as const;
+export type LoyaltyOperationType = (typeof LOYALTY_OPERATION_TYPES)[number];
+
+export const LOYALTY_OPERATION_STATUSES = [
+  "pending",
+  "done",
+  "failed",
+] as const;
+export type LoyaltyOperationStatus =
+  (typeof LOYALTY_OPERATION_STATUSES)[number];
+
+// Local record of every Voucherify balance mutation. The id is the sourceId
+// sent to Voucherify, so retries are idempotent. It is never a balance source.
+export const loyaltyOperations = sqliteTable(
+  "loyalty_operations",
+  {
+    id: text("id").primaryKey(),
+    reservationId: text("reservation_id")
+      .notNull()
+      .references(() => reservations.id, { onDelete: "cascade" }),
+    // No foreign key: a spend is recorded before its payment row exists.
+    paymentId: text("payment_id"),
+    type: text("type").$type<LoyaltyOperationType>().notNull(),
+    points: integer("points").notNull(),
+    status: text("status")
+      .$type<LoyaltyOperationStatus>()
+      .notNull()
+      .default("pending"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+  },
+  (table) => [
+    index("loyalty_operations_reservation_id_idx").on(table.reservationId),
+    index("loyalty_operations_payment_id_idx").on(table.paymentId),
+    check(
+      "loyalty_operations_type_check",
+      sql`${table.type} in ('spend', 'earn', 'restore')`,
+    ),
+    check(
+      "loyalty_operations_status_check",
+      sql`${table.status} in ('pending', 'done', 'failed')`,
+    ),
+  ],
+);
+
+export const JOB_TASKS = [
+  "refund-payment",
+  "credit-points",
+  "restore-points",
+  "send-ticket-email",
+] as const;
 export type JobTask = (typeof JOB_TASKS)[number];
 
 // Outbox / background job queue (E06, E07). A job is hidden until visibleAt,
@@ -199,3 +260,4 @@ export type IdempotencyKeyRow = typeof idempotencyKeys.$inferSelect;
 export type PaymentRow = typeof payments.$inferSelect;
 export type StripeEventRow = typeof stripeEvents.$inferSelect;
 export type JobRow = typeof jobs.$inferSelect;
+export type LoyaltyOperationRow = typeof loyaltyOperations.$inferSelect;

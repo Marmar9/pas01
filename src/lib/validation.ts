@@ -12,6 +12,22 @@ const seatIdSchema = z
     message: 'Seat must be a row letter followed by a number, e.g. "A2".',
   });
 
+export const emailSchema = z
+  .string()
+  .trim()
+  .max(254, "Email is too long.")
+  .pipe(z.email("Enter a valid email address."))
+  .transform((value) => value.toLowerCase());
+
+export const checkoutInputSchema = z.object({
+  points: z
+    .number("Points must be a number.")
+    .int("Points must be a whole number.")
+    .min(0, "Points cannot be negative.")
+    .max(Number.MAX_SAFE_INTEGER, "Points value is too large.")
+    .optional(),
+});
+
 export const reservationInputSchema = z.object({
   eventId: z.string().trim().min(1, "Event is required.").max(64),
   seatId: seatIdSchema,
@@ -20,12 +36,7 @@ export const reservationInputSchema = z.object({
     .trim()
     .min(1, "Name is required.")
     .max(100, "Name is too long."),
-  email: z
-    .string()
-    .trim()
-    .max(254, "Email is too long.")
-    .pipe(z.email("Enter a valid email address."))
-    .transform((value) => value.toLowerCase()),
+  email: emailSchema,
 });
 
 export const idempotencyKeySchema = z
