@@ -350,9 +350,7 @@ describe("client api", () => {
         409,
       )) as typeof fetch;
 
-    const error = await startCheckout("res-1", 1000).catch(
-      (caught) => caught,
-    );
+    const error = await startCheckout("res-1", 1000).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(ApiError);
     expect(error.status).toBe(409);
