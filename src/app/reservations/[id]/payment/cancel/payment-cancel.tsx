@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { PurchaseSummary } from "@/components/purchase-summary";
 import { StateCard } from "@/components/state-card";
 import {
   ApiError,
@@ -10,12 +11,15 @@ import {
   startCheckout,
 } from "@/lib/client-api";
 import { formatCountdown, formatPrice } from "@/lib/format";
+import { cardAmountFor } from "@/lib/loyalty-points";
 import { Confirmation } from "../../confirmation";
+
+type PaidReservation = ReservationState & { code: string };
 
 type CancelState =
   | { status: "loading" }
   | { status: "held"; reservation: ReservationState }
-  | { status: "paid"; code: string }
+  | { status: "paid"; reservation: PaidReservation }
   | { status: "expired"; amount: number }
   | { status: "not-found" }
   | { status: "error"; message: string };
@@ -24,9 +28,11 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
   const [state, setState] = useState<CancelState>({ status: "loading" });
   const [now, setNow] = useState(() => Date.now());
   const [pending, setPending] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setState({ status: "loading" });
+    setNotice(null);
 
     try {
       const reservation = await getReservation(reservationId);
@@ -41,7 +47,10 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
           return;
         }
 
-        setState({ status: "paid", code: reservation.code });
+        setState({
+          status: "paid",
+          reservation: { ...reservation, code: reservation.code },
+        });
         return;
       }
 
@@ -98,10 +107,15 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
       return;
     }
 
+    const lockedPoints = state.reservation.pointsUsed;
     setPending(true);
+    setNotice(null);
 
     try {
-      const checkout = await startCheckout(reservationId);
+      const checkout = await startCheckout(
+        reservationId,
+        lockedPoints > 0 ? lockedPoints : undefined,
+      );
       window.location.assign(checkout.url);
     } catch (error) {
       if (error instanceof ApiError) {
@@ -113,12 +127,31 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
           return;
         }
 
+        if (
+          error.code === "INSUFFICIENT_POINTS" ||
+          error.code === "POINTS_LIMIT_EXCEEDED"
+        ) {
+          await load();
+          setNotice(
+            "Saldo punktów się zmieniło. Kwota została zaktualizowana — spróbuj ponownie.",
+          );
+          return;
+        }
+
         if (error.code === "PAYMENT_UNAVAILABLE") {
           setState({
             status: "error",
             message:
               "Płatności online są chwilowo niedostępne. Spróbuj ponownie za chwilę.",
           });
+          return;
+        }
+
+        if (error.code === "LOYALTY_UNAVAILABLE") {
+          await load();
+          setNotice(
+            "Program lojalnościowy jest chwilowo niedostępny. Spróbuj ponownie, aby zapłacić kartą.",
+          );
           return;
         }
       }
@@ -145,13 +178,26 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
   }
 
   if (state.status === "paid") {
-    return <Confirmation code={state.code} />;
+    return (
+      <Confirmation
+        code={state.reservation.code}
+        summary={{
+          amount: state.reservation.amount,
+          pointsUsed: state.reservation.pointsUsed,
+          pointsEarned: state.reservation.pointsEarned,
+        }}
+      />
+    );
   }
 
   if (state.status === "held") {
     const remaining = Math.max(
       0,
       Date.parse(state.reservation.expiresAt) - now,
+    );
+    const cardAmount = cardAmountFor(
+      state.reservation.amount,
+      state.reservation.pointsUsed,
     );
 
     return (
@@ -160,7 +206,7 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
           icon="warning"
           title="Płatność została przerwana"
           description={`Twoje miejsce nadal czeka. Możesz zapłacić ${formatPrice(
-            state.reservation.amount,
+            cardAmount,
           )} ponownie, dopóki rezerwacja jest ważna.`}
           action={
             <>
@@ -172,7 +218,7 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
               >
                 {pending
                   ? "Przekierowujemy…"
-                  : `Zapłać ${formatPrice(state.reservation.amount)}`}
+                  : `Zapłać ${formatPrice(cardAmount)}`}
               </button>
               <Link href="/" className="btn-ghost">
                 Wróć do repertuaru
@@ -180,6 +226,17 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
             </>
           }
         />
+        {notice ? (
+          <output className="mx-auto mt-6 block max-w-md rounded-xl border border-secondary/30 bg-secondary/10 px-4 py-3 text-center text-sm text-white">
+            {notice}
+          </output>
+        ) : null}
+        <div className="mx-auto max-w-xl">
+          <PurchaseSummary
+            amount={state.reservation.amount}
+            pointsUsed={state.reservation.pointsUsed}
+          />
+        </div>
         <p className="mx-auto mt-6 max-w-md text-center text-xs text-zinc-500">
           Rezerwacja wygaśnie za {formatCountdown(remaining)}.
         </p>

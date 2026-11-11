@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { PurchaseSummary } from "@/components/purchase-summary";
 import { StateCard } from "@/components/state-card";
 import {
   ApiError,
@@ -9,16 +10,19 @@ import {
   type ReservationState,
 } from "@/lib/client-api";
 import { formatCountdown, formatPrice } from "@/lib/format";
+import { cardAmountFor } from "@/lib/loyalty-points";
 import {
   type ReservationMeta,
   readReservationMeta,
 } from "@/lib/reservation-meta";
 import { Confirmation } from "../../confirmation";
 
+type PaidReservation = ReservationState & { code: string };
+
 type PaymentState =
   | { status: "loading" }
   | { status: "pending"; reservation: ReservationState }
-  | { status: "paid"; code: string }
+  | { status: "paid"; reservation: PaidReservation }
   | { status: "expired"; amount: number }
   | { status: "not-found" }
   | { status: "error"; message: string };
@@ -52,7 +56,10 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
           return;
         }
 
-        setState({ status: "paid", code: reservation.code });
+        setState({
+          status: "paid",
+          reservation: { ...reservation, code: reservation.code },
+        });
         return;
       }
 
@@ -131,9 +138,14 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
   if (state.status === "paid") {
     return (
       <Confirmation
-        code={state.code}
+        code={state.reservation.code}
         eventId={meta?.eventId}
         seatId={meta?.seatId}
+        summary={{
+          amount: state.reservation.amount,
+          pointsUsed: state.reservation.pointsUsed,
+          pointsEarned: state.reservation.pointsEarned,
+        }}
       />
     );
   }
@@ -143,6 +155,10 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
       0,
       Date.parse(state.reservation.expiresAt) - now,
     );
+    const cardAmount = cardAmountFor(
+      state.reservation.amount,
+      state.reservation.pointsUsed,
+    );
 
     return (
       <div className="container-page pb-24 pt-28 sm:pt-32">
@@ -150,7 +166,7 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
           icon="spinner"
           title="Płatność w toku…"
           description={`Stripe potwierdza płatność ${formatPrice(
-            state.reservation.amount,
+            cardAmount,
           )}. Ta strona odświeży się automatycznie, gdy bilet będzie gotowy.`}
           action={
             <span
@@ -161,6 +177,12 @@ export function PaymentSuccess({ reservationId }: { reservationId: string }) {
             </span>
           }
         />
+        <div className="mx-auto max-w-xl">
+          <PurchaseSummary
+            amount={state.reservation.amount}
+            pointsUsed={state.reservation.pointsUsed}
+          />
+        </div>
         <p className="mx-auto mt-6 max-w-md text-center text-xs text-zinc-500">
           Nie zamykaj tej strony. Jeśli płatność została przerwana, możesz
           wrócić i spróbować ponownie, dopóki rezerwacja jest ważna.
