@@ -2,6 +2,10 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import {
+  PurchaseSummary,
+  type PurchaseSummaryData,
+} from "@/components/purchase-summary";
 import { type EventDto, getEvent } from "@/lib/client-api";
 import { eventTheme } from "@/lib/event-theme";
 import { formatEventDate } from "@/lib/format";
@@ -10,6 +14,7 @@ type ConfirmationProps = {
   code: string;
   eventId?: string;
   seatId?: string;
+  summary?: PurchaseSummaryData;
 };
 
 type EventState =
@@ -18,7 +23,12 @@ type EventState =
   | { status: "error" }
   | { status: "success"; event: EventDto };
 
-export function Confirmation({ code, eventId, seatId }: ConfirmationProps) {
+export function Confirmation({
+  code,
+  eventId,
+  seatId,
+  summary,
+}: ConfirmationProps) {
   const [eventState, setEventState] = useState<EventState>(
     eventId ? { status: "loading" } : { status: "idle" },
   );
@@ -150,6 +160,8 @@ export function Confirmation({ code, eventId, seatId }: ConfirmationProps) {
             </div>
           </div>
         </div>
+
+        {summary ? <PurchaseSummary {...summary} /> : null}
 
         <div className="mt-10 flex flex-col gap-3 sm:flex-row sm:justify-center">
           <Link href="/" className="btn-primary justify-center">

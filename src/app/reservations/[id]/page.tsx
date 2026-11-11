@@ -46,6 +46,11 @@ async function TicketFromParams({
       code={ticket.code}
       eventId={ticket.eventId}
       seatId={ticket.seatId}
+      summary={{
+        amount: ticket.amount,
+        pointsUsed: ticket.pointsUsed,
+        pointsEarned: ticket.pointsEarned,
+      }}
     />
   );
 }
