@@ -20,7 +20,7 @@ type CancelState =
   | { status: "loading" }
   | { status: "held"; reservation: ReservationState }
   | { status: "paid"; reservation: PaidReservation }
-  | { status: "expired"; amount: number }
+  | { status: "expired"; amount: number; pointsUsed: number }
   | { status: "not-found" }
   | { status: "error"; message: string };
 
@@ -61,7 +61,11 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
         !Number.isFinite(expiresAt) ||
         expiresAt <= Date.now()
       ) {
-        setState({ status: "expired", amount: reservation.amount });
+        setState({
+          status: "expired",
+          amount: reservation.amount,
+          pointsUsed: reservation.pointsUsed,
+        });
         return;
       }
 
@@ -98,7 +102,11 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
       state.status === "held" &&
       Date.parse(state.reservation.expiresAt) <= now
     ) {
-      setState({ status: "expired", amount: state.reservation.amount });
+      setState({
+        status: "expired",
+        amount: state.reservation.amount,
+        pointsUsed: state.reservation.pointsUsed,
+      });
     }
   }, [state, now]);
 
@@ -251,7 +259,7 @@ export function PaymentCancel({ reservationId }: { reservationId: string }) {
           icon="warning"
           title="Rezerwacja wygasła"
           description={`Czas na opłacenie ${formatPrice(
-            state.amount,
+            cardAmountFor(state.amount, state.pointsUsed),
           )} minął, więc miejsce zostało zwolnione.`}
           action={
             <Link href="/" className="btn-primary">
