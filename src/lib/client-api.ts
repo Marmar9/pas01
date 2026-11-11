@@ -7,6 +7,10 @@ export type ApiErrorCode =
   | "SEAT_TAKEN"
   | "IDEMPOTENCY_KEY_REUSED"
   | "PAYMENT_UNAVAILABLE"
+  | "LOYALTY_UNAVAILABLE"
+  | "POINTS_LIMIT_EXCEEDED"
+  | "INSUFFICIENT_POINTS"
+  | "CHECKOUT_IN_PROGRESS"
   | "INVALID_SIGNATURE"
   | "RATE_LIMITED"
   | "INTERNAL_ERROR"
@@ -49,6 +53,13 @@ export type ReservationState = {
   amount: number;
   expiresAt: string;
   code?: string;
+  pointsUsed: number;
+  pointsEarned?: number;
+};
+
+export type LoyaltyBalance = {
+  email: string;
+  points: number;
 };
 
 export type CheckoutResult = {
@@ -118,6 +129,10 @@ function toErrorCode(value: unknown): ApiErrorCode {
     "SEAT_TAKEN",
     "IDEMPOTENCY_KEY_REUSED",
     "PAYMENT_UNAVAILABLE",
+    "LOYALTY_UNAVAILABLE",
+    "POINTS_LIMIT_EXCEEDED",
+    "INSUFFICIENT_POINTS",
+    "CHECKOUT_IN_PROGRESS",
     "INVALID_SIGNATURE",
     "RATE_LIMITED",
     "INTERNAL_ERROR",
@@ -317,6 +332,8 @@ export async function getReservation(
     amount?: unknown;
     expiresAt?: unknown;
     code?: unknown;
+    pointsUsed?: unknown;
+    pointsEarned?: unknown;
   }>(`/api/reservations/${encodeURIComponent(reservationId)}`);
 
   if (
@@ -326,7 +343,10 @@ export async function getReservation(
       payload.status !== "expired") ||
     typeof payload.amount !== "number" ||
     typeof payload.expiresAt !== "string" ||
-    (payload.code !== undefined && typeof payload.code !== "string")
+    typeof payload.pointsUsed !== "number" ||
+    (payload.code !== undefined && typeof payload.code !== "string") ||
+    (payload.pointsEarned !== undefined &&
+      typeof payload.pointsEarned !== "number")
   ) {
     throw new ApiError(
       200,
@@ -340,15 +360,47 @@ export async function getReservation(
     amount: payload.amount,
     expiresAt: payload.expiresAt,
     ...(typeof payload.code === "string" ? { code: payload.code } : {}),
+    pointsUsed: payload.pointsUsed,
+    ...(typeof payload.pointsEarned === "number"
+      ? { pointsEarned: payload.pointsEarned }
+      : {}),
   };
+}
+
+export async function getLoyalty(email: string): Promise<LoyaltyBalance> {
+  const payload = await requestJson<{ email?: unknown; points?: unknown }>(
+    `/api/loyalty?email=${encodeURIComponent(email)}`,
+  );
+
+  if (
+    !isRecord(payload) ||
+    typeof payload.email !== "string" ||
+    typeof payload.points !== "number" ||
+    !Number.isFinite(payload.points)
+  ) {
+    throw new ApiError(
+      200,
+      "INVALID_RESPONSE",
+      "Serwer nie zwrócił salda punktów.",
+    );
+  }
+
+  return { email: payload.email, points: payload.points };
 }
 
 export async function startCheckout(
   reservationId: string,
+  points?: number,
 ): Promise<CheckoutResult> {
   const payload = await requestJson<{ url?: unknown }>(
     `/api/reservations/${encodeURIComponent(reservationId)}/checkout`,
-    { method: "POST" },
+    points === undefined
+      ? { method: "POST" }
+      : {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ points }),
+        },
   );
 
   if (!isRecord(payload) || typeof payload.url !== "string") {

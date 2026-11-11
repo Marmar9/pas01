@@ -416,6 +416,9 @@ export type PaidTicket = {
   code: string;
   eventId: string;
   seatId: string;
+  amount: number;
+  pointsUsed: number;
+  pointsEarned: number;
 };
 
 // Ticket pages render a code only after the database confirms it belongs to a
@@ -426,6 +429,9 @@ export function getPaidTicketByCode(db: Db, code: string): PaidTicket | null {
       code: reservations.code,
       eventId: reservations.eventId,
       seatId: reservations.seatId,
+      amount: reservations.amount,
+      pointsUsed: reservations.pointsUsed,
+      pointsEarned: reservations.pointsEarned,
     })
     .from(reservations)
     .where(and(eq(reservations.code, code), eq(reservations.status, "paid")))
@@ -436,6 +442,9 @@ export function getPaidTicketByCode(db: Db, code: string): PaidTicket | null {
         code: reservation.code,
         eventId: reservation.eventId,
         seatId: reservation.seatId,
+        amount: reservation.amount,
+        pointsUsed: reservation.pointsUsed,
+        pointsEarned: reservation.pointsEarned ?? 0,
       }
     : null;
 }

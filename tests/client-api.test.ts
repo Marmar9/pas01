@@ -4,6 +4,7 @@ import {
   createReservation,
   getEvent,
   getEvents,
+  getLoyalty,
   getReservation,
   purchaseReservation,
   startCheckout,
@@ -209,6 +210,8 @@ describe("client api", () => {
         amount: 3200,
         expiresAt: "2026-10-28T12:15:00.000Z",
         code: "ABC12345",
+        pointsUsed: 0,
+        pointsEarned: 0,
       });
     }) as typeof fetch;
 
@@ -219,6 +222,8 @@ describe("client api", () => {
       amount: 3200,
       expiresAt: "2026-10-28T12:15:00.000Z",
       code: "ABC12345",
+      pointsUsed: 0,
+      pointsEarned: 0,
     });
   });
 
@@ -228,6 +233,7 @@ describe("client api", () => {
         status: "held",
         amount: 3200,
         expiresAt: "2026-10-28T12:15:00.000Z",
+        pointsUsed: 0,
       })) as typeof fetch;
 
     const result = await getReservation("res-1");
@@ -276,5 +282,78 @@ describe("client api", () => {
     expect(error).toBeInstanceOf(ApiError);
     expect(error.status).toBe(503);
     expect(error.code).toBe("PAYMENT_UNAVAILABLE");
+  });
+
+  test("fetches a loyalty balance", async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("/api/loyalty?email=jan%40example.com");
+      return jsonResponse({ email: "jan@example.com", points: 1000 });
+    }) as typeof fetch;
+
+    expect(await getLoyalty("jan@example.com")).toEqual({
+      email: "jan@example.com",
+      points: 1000,
+    });
+  });
+
+  test("rejects a malformed loyalty balance", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({
+        email: "jan@example.com",
+        points: "1000",
+      })) as typeof fetch;
+
+    const error = await getLoyalty("jan@example.com").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.code).toBe("INVALID_RESPONSE");
+  });
+
+  test("sends points only when supplied", async () => {
+    const bodies: Array<string | undefined> = [];
+
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      bodies.push(init?.body as string | undefined);
+      return jsonResponse({ url: "https://checkout.stripe.com/cs_test_1" });
+    }) as typeof fetch;
+
+    await startCheckout("res-1", 1000);
+    await startCheckout("res-1");
+
+    expect(bodies).toEqual(['{"points":1000}', undefined]);
+  });
+
+  test("reads the points split from a reservation", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({
+        status: "paid",
+        amount: 3200,
+        expiresAt: "2026-10-28T12:15:00.000Z",
+        code: "ABC12345",
+        pointsUsed: 1000,
+        pointsEarned: 220,
+      })) as typeof fetch;
+
+    const result = await getReservation("res-1");
+
+    expect(result.pointsUsed).toBe(1000);
+    expect(result.pointsEarned).toBe(220);
+  });
+
+  test("exposes loyalty checkout refusals", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        { error: "Not enough loyalty points.", code: "INSUFFICIENT_POINTS" },
+        409,
+      )) as typeof fetch;
+
+    const error = await startCheckout("res-1", 1000).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(409);
+    expect(error.code).toBe("INSUFFICIENT_POINTS");
   });
 });
