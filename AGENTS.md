@@ -541,7 +541,7 @@ db: Drizzle orm, better-sqlite3 driver
 libraries: nanoid (reservation codes), object-hash (idempotency fingerprints),
 @universal-rate-limit/nextjs (sliding-window IP rate limiting),
 stripe (official Stripe Node SDK, server-side only),
-voucherify (official Voucherify Node SDK, server-side only),
+@voucherify/sdk (official Voucherify JS SDK, server-side only),
 resend (official Resend Node SDK, server-side only)
 external services: Stripe (test mode), Voucherify (Sandbox project; at most
 100 API calls per hour), Resend (test mode; without a verified domain it sends

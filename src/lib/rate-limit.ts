@@ -28,6 +28,11 @@ export const RATE_LIMITS = {
     limit: 120,
     algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
   },
+  loyalty: {
+    // Balance lookups by email: keep them low to limit enumeration.
+    limit: 30,
+    algorithm: { type: "sliding-window", windowMs: WINDOW_MS },
+  },
   checkout: {
     limit: 20,
     algorithm: { type: "sliding-window", windowMs: WINDOW_MS },

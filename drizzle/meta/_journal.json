@@ -50,6 +50,13 @@
       "when": 1793784126341,
       "tag": "0006_refunds_outbox",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794387539199,
+      "tag": "0007_loyalty_points",
+      "breakpoints": true
     }
   ]
 }

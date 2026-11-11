@@ -4,7 +4,9 @@ export const STRIPE_CURRENCY = "pln";
 
 export type CheckoutSessionInput = {
   reservationId: string;
+  // Card amount: reservation.amount - pointsUsed.
   amount: number;
+  pointsUsed: number;
   customerEmail: string;
   eventTitle: string;
   seatId: string;
@@ -72,7 +74,10 @@ export function createStripeCheckoutGateway(stripe: Stripe): CheckoutGateway {
           mode: "payment",
           client_reference_id: input.reservationId,
           customer_email: input.customerEmail,
-          metadata: { reservationId: input.reservationId },
+          metadata: {
+            reservationId: input.reservationId,
+            pointsUsed: String(input.pointsUsed),
+          },
           line_items: [
             {
               quantity: 1,

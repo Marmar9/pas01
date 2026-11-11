@@ -28,6 +28,10 @@ async function handler(
       amount: state.amount,
       expiresAt: state.expiresAt,
       ...(state.code ? { code: state.code } : {}),
+      pointsUsed: state.pointsUsed,
+      ...(state.status === "paid"
+        ? { pointsEarned: state.pointsEarned ?? 0 }
+        : {}),
     });
   } catch (error) {
     console.error("Failed to load reservation:", error);

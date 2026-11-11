@@ -1,7 +1,14 @@
 import { getDb } from "@/db/client";
+import { sweepExpiredHolds } from "./holds";
 import { type JobHandlers, runDueJobs } from "./jobs";
+import {
+  createCreditPointsHandler,
+  createRestorePointsHandler,
+} from "./loyalty";
 import { createRefundHandler } from "./refunds";
 import { getStripeRefundGateway } from "./stripe";
+import { createTicketEmailHandler, getResendGateway } from "./ticket-email";
+import { getVoucherifyGateway } from "./voucherify";
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -12,6 +19,9 @@ const globalForWorker = globalThis as typeof globalThis & {
 function jobHandlers(): JobHandlers {
   return {
     "refund-payment": createRefundHandler(getDb(), getStripeRefundGateway),
+    "credit-points": createCreditPointsHandler(getDb(), getVoucherifyGateway),
+    "restore-points": createRestorePointsHandler(getDb(), getVoucherifyGateway),
+    "send-ticket-email": createTicketEmailHandler(getDb(), getResendGateway),
   };
 }
 
@@ -30,6 +40,13 @@ export function startJobWorker(): void {
     running = true;
 
     try {
+      try {
+        sweepExpiredHolds(getDb());
+      } catch (error) {
+        // A failing sweep must not stop the job queue.
+        console.error("Expired hold sweep failed:", error);
+      }
+
       await runDueJobs(getDb(), jobHandlers());
     } catch (error) {
       console.error("Background job worker tick failed:", error);

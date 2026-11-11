@@ -9,8 +9,22 @@ import {
   type ReservationStatus,
   reservations,
 } from "@/db/schema";
+import { expireHold, reconcileOrphanSpends } from "./holds";
+import {
+  applyLoyaltyOperation,
+  enqueueRestorePoints,
+  getLoyaltyBalance,
+  type LoyaltyGateway,
+  maxPointsForAmount,
+  releasePaymentPoints,
+  spendSourceId,
+} from "./loyalty";
 import { generateReservationCode } from "./reservation-code";
-import { type CheckoutGateway, STRIPE_CURRENCY } from "./stripe";
+import {
+  type CheckoutGateway,
+  type CheckoutSessionInput,
+  STRIPE_CURRENCY,
+} from "./stripe";
 import { isSeatInLayout, parseSeatId } from "./validation";
 
 export type CreateReservationInput = {
@@ -47,6 +61,8 @@ export type ReservationState = {
   amount: number;
   expiresAt: string;
   code: string | null;
+  pointsUsed: number;
+  pointsEarned: number | null;
 };
 
 export type StartCheckoutResult =
@@ -57,16 +73,23 @@ export type StartCheckoutResult =
         | "reservation_not_found"
         | "reservation_expired"
         | "reservation_already_paid"
-        | "payment_unavailable";
+        | "payment_unavailable"
+        | "points_limit_exceeded"
+        | "insufficient_points"
+        | "checkout_in_progress"
+        | "loyalty_unavailable";
     };
 
+export type StartCheckoutOptions = {
+  // undefined when the request body did not supply points.
+  points?: number;
+  loyalty?: LoyaltyGateway | null;
+};
+
+// session.amount is the card amount (reservation amount minus points).
 export type CheckoutContext = {
-  reservationId: string;
-  amount: number;
-  customerEmail: string;
-  seatId: string;
-  eventTitle: string;
-  idempotencyKey: string;
+  session: CheckoutSessionInput;
+  paymentId: string;
 };
 
 type CheckoutPreparation =
@@ -247,8 +270,9 @@ export function createReservation(
 
         // Expired holds no longer block the seat. Mark them explicitly so the
         // partial unique index accepts a new hold for the same seat.
-        tx.update(reservations)
-          .set({ status: "expired" })
+        const staleHolds = tx
+          .select({ id: reservations.id })
+          .from(reservations)
           .where(
             and(
               eq(reservations.eventId, normalized.eventId),
@@ -257,7 +281,11 @@ export function createReservation(
               lte(reservations.expiresAt, now),
             ),
           )
-          .run();
+          .all();
+
+        for (const stale of staleHolds) {
+          expireHold(tx, stale.id, now);
+        }
 
         const taken = tx
           .select({ id: reservations.id })
@@ -335,16 +363,17 @@ function toReservationState(reservation: ReservationRow): ReservationState {
     amount: reservation.amount,
     expiresAt: reservation.expiresAt.toISOString(),
     code: reservation.code,
+    pointsUsed: reservation.pointsUsed,
+    pointsEarned: reservation.pointsEarned,
   };
 }
 
-function markExpired(tx: Db, reservationId: string): void {
-  tx.update(reservations)
-    .set({ status: "expired" })
-    .where(
-      and(eq(reservations.id, reservationId), eq(reservations.status, "held")),
-    )
-    .run();
+function findReservation(tx: Db, reservationId: string) {
+  return tx
+    .select()
+    .from(reservations)
+    .where(eq(reservations.id, reservationId))
+    .get();
 }
 
 export function getReservationState(
@@ -370,9 +399,11 @@ export function getReservationState(
         reservation.status === "held" &&
         reservation.expiresAt.getTime() <= now.getTime()
       ) {
-        markExpired(tx, reservationId);
+        expireHold(tx, reservationId, now);
 
-        return { ...toReservationState(reservation), status: "expired" };
+        const expired = findReservation(tx, reservationId);
+
+        return toReservationState(expired ?? reservation);
       }
 
       return toReservationState(reservation);
@@ -409,7 +440,11 @@ export function getPaidTicketByCode(db: Db, code: string): PaidTicket | null {
     : null;
 }
 
-function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
+function prepareCheckout(
+  db: Db,
+  reservationId: string,
+  requestedPoints: number | undefined,
+): CheckoutPreparation {
   return db.transaction(
     (tx) => {
       // Judge expiry only after BEGIN IMMEDIATE has acquired the write lock;
@@ -434,7 +469,7 @@ function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
         reservation.expiresAt.getTime() <= now.getTime()
       ) {
         if (reservation.status !== "expired") {
-          markExpired(tx, reservationId);
+          expireHold(tx, reservationId, now);
         }
 
         return { ok: false, reason: "reservation_expired" };
@@ -443,6 +478,14 @@ function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
       if (reservation.amount <= 0) {
         return { ok: false, reason: "payment_unavailable" };
       }
+
+      const points = requestedPoints ?? 0;
+
+      if (points > maxPointsForAmount(reservation.amount)) {
+        return { ok: false, reason: "points_limit_exceeded" };
+      }
+
+      reconcileOrphanSpends(tx, { reservationId, now });
 
       const event = tx
         .select({ title: events.title })
@@ -457,7 +500,10 @@ function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
       // A pending Checkout Session stays valid much longer than the hold, so
       // retries can reuse it instead of opening another payment attempt.
       const pendingPayment = tx
-        .select({ checkoutUrl: payments.checkoutUrl })
+        .select({
+          checkoutUrl: payments.checkoutUrl,
+          pointsUsed: payments.pointsUsed,
+        })
         .from(payments)
         .where(
           and(
@@ -467,6 +513,15 @@ function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
         )
         .orderBy(desc(payments.createdAt))
         .get();
+
+      // The open attempt locks its points split until the session ends.
+      if (
+        pendingPayment &&
+        requestedPoints !== undefined &&
+        requestedPoints !== pendingPayment.pointsUsed
+      ) {
+        return { ok: false, reason: "checkout_in_progress" };
+      }
 
       // Retries and concurrent requests for the same attempt share one key,
       // so Stripe returns the session it already created. Once an attempt is
@@ -480,12 +535,18 @@ function prepareCheckout(db: Db, reservationId: string): CheckoutPreparation {
       return {
         ok: true,
         context: {
-          reservationId: reservation.id,
-          amount: reservation.amount,
-          customerEmail: reservation.email,
-          seatId: reservation.seatId,
-          eventTitle: event.title,
-          idempotencyKey: `checkout:${reservation.id}:${previousAttempts + 1}`,
+          session: {
+            reservationId: reservation.id,
+            amount: reservation.amount - points,
+            pointsUsed: points,
+            customerEmail: reservation.email,
+            seatId: reservation.seatId,
+            eventTitle: event.title,
+            idempotencyKey: `checkout:${reservation.id}:${
+              previousAttempts + 1
+            }`,
+          },
+          paymentId: crypto.randomUUID(),
         },
         existingUrl: pendingPayment?.checkoutUrl ?? null,
       };
@@ -502,11 +563,8 @@ function recordCheckoutSession(
   return db.transaction(
     (tx) => {
       const now = new Date();
-      const reservation = tx
-        .select()
-        .from(reservations)
-        .where(eq(reservations.id, context.reservationId))
-        .get();
+      const reservationId = context.session.reservationId;
+      const reservation = findReservation(tx, reservationId);
 
       if (!reservation) {
         return { ok: false, reason: "reservation_not_found" };
@@ -521,7 +579,7 @@ function recordCheckoutSession(
         reservation.expiresAt.getTime() <= now.getTime()
       ) {
         if (reservation.status !== "expired") {
-          markExpired(tx, context.reservationId);
+          expireHold(tx, reservationId, now);
         }
 
         return { ok: false, reason: "reservation_expired" };
@@ -544,12 +602,13 @@ function recordCheckoutSession(
       const inserted = tx
         .insert(payments)
         .values({
-          id: crypto.randomUUID(),
-          reservationId: context.reservationId,
+          id: context.paymentId,
+          reservationId,
           stripeCheckoutSessionId: session.id,
           stripePaymentIntentId: null,
           checkoutUrl: session.url,
-          amount: context.amount,
+          amount: context.session.amount,
+          pointsUsed: context.session.pointsUsed,
           currency: STRIPE_CURRENCY,
           status: "pending",
           createdAt: now,
@@ -560,6 +619,16 @@ function recordCheckoutSession(
         .get();
 
       if (inserted?.checkoutUrl) {
+        tx.update(reservations)
+          .set({ pointsUsed: context.session.pointsUsed })
+          .where(
+            and(
+              eq(reservations.id, reservationId),
+              eq(reservations.status, "held"),
+            ),
+          )
+          .run();
+
         return { ok: true, url: inserted.checkoutUrl };
       }
 
@@ -579,16 +648,136 @@ function recordCheckoutSession(
   );
 }
 
+// Records an attempt that will never be payable, so the attempt counter (and
+// with it the Stripe idempotency key) advances. restorePoints is set when the
+// debit happened or its outcome is still unknown.
+function recordFailedAttempt(
+  db: Db,
+  context: CheckoutContext,
+  session: { id: string; url: string | null },
+  restorePoints: boolean,
+): void {
+  db.transaction(
+    (tx) => {
+      const now = new Date();
+
+      tx.insert(payments)
+        .values({
+          id: context.paymentId,
+          reservationId: context.session.reservationId,
+          stripeCheckoutSessionId: session.id,
+          stripePaymentIntentId: null,
+          checkoutUrl: session.url,
+          amount: context.session.amount,
+          pointsUsed: context.session.pointsUsed,
+          currency: STRIPE_CURRENCY,
+          status: "failed",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .onConflictDoNothing()
+        .run();
+
+      if (restorePoints) {
+        enqueueRestorePoints(tx, context.paymentId, now);
+      }
+    },
+    { behavior: "immediate" },
+  );
+}
+
+async function expireSession(
+  gateway: CheckoutGateway,
+  sessionId: string,
+  why: string,
+): Promise<void> {
+  try {
+    await gateway.expireCheckoutSession(sessionId);
+  } catch (error) {
+    console.error(`Failed to expire ${why} Stripe session:`, error);
+  }
+}
+
+async function debitPointsAndRecord(
+  db: Db,
+  gateway: CheckoutGateway,
+  loyalty: LoyaltyGateway,
+  context: CheckoutContext,
+  session: { id: string; url: string | null },
+): Promise<StartCheckoutResult> {
+  const spend = await applyLoyaltyOperation(
+    db,
+    loyalty,
+    {
+      id: spendSourceId(session.id),
+      type: "spend",
+      reservationId: context.session.reservationId,
+      paymentId: context.paymentId,
+      points: context.session.pointsUsed,
+      email: context.session.customerEmail,
+    },
+    { reconcileNow: true },
+  );
+  // A concurrent request for the same session may have recorded the spend
+  // first; its payment id is the one the restore job keys on.
+  const attempt: CheckoutContext = {
+    ...context,
+    paymentId: spend.operation.paymentId ?? context.paymentId,
+  };
+
+  if (spend.status !== "done") {
+    try {
+      recordFailedAttempt(db, attempt, session, spend.status === "uncertain");
+    } catch (error) {
+      console.error("Failed to record a failed points checkout:", error);
+    }
+
+    await expireSession(gateway, session.id, "unpaid points");
+
+    return {
+      ok: false,
+      reason:
+        spend.status === "failed" && spend.kind === "insufficient_points"
+          ? "insufficient_points"
+          : "loyalty_unavailable",
+    };
+  }
+
+  let recorded: StartCheckoutResult;
+
+  try {
+    recorded = recordCheckoutSession(db, attempt, session);
+  } catch (error) {
+    console.error("Failed to record a points checkout:", error);
+    recorded = { ok: false, reason: "payment_unavailable" };
+  }
+
+  if (!recorded.ok) {
+    // Never hand out a session whose debit is not backed by a payment row.
+    try {
+      recordFailedAttempt(db, attempt, session, true);
+    } catch (error) {
+      // The "done" spend without a payment row is reconciled later.
+      console.error("Failed to record a rejected points checkout:", error);
+    }
+
+    await expireSession(gateway, session.id, "rejected");
+  }
+
+  return recorded;
+}
+
 export async function startCheckout(
   db: Db,
   reservationId: string,
   gateway: CheckoutGateway | null,
+  options: StartCheckoutOptions = {},
 ): Promise<StartCheckoutResult> {
   if (!gateway) {
     return { ok: false, reason: "payment_unavailable" };
   }
 
-  const prepared = prepareCheckout(db, reservationId);
+  const prepared = prepareCheckout(db, reservationId, options.points);
 
   if (!prepared.ok) {
     return prepared;
@@ -598,33 +787,55 @@ export async function startCheckout(
     return { ok: true, url: prepared.existingUrl };
   }
 
+  const { context } = prepared;
+  const points = context.session.pointsUsed;
+  const loyalty = options.loyalty ?? null;
+
+  if (points > 0) {
+    if (!loyalty) {
+      return { ok: false, reason: "loyalty_unavailable" };
+    }
+
+    let balance: number;
+
+    try {
+      balance = await getLoyaltyBalance(loyalty, context.session.customerEmail);
+    } catch (error) {
+      console.error(
+        "Failed to read the loyalty balance:",
+        error instanceof Error ? error.message : "unknown error",
+      );
+      return { ok: false, reason: "loyalty_unavailable" };
+    }
+
+    if (points > balance) {
+      return { ok: false, reason: "insufficient_points" };
+    }
+  }
+
   let session: { id: string; url: string | null };
 
   try {
-    session = await gateway.createCheckoutSession(prepared.context);
+    session = await gateway.createCheckoutSession(context.session);
   } catch (error) {
     console.error("Failed to create Stripe Checkout Session:", error);
     return { ok: false, reason: "payment_unavailable" };
   }
 
   if (!session.url) {
-    try {
-      await gateway.expireCheckoutSession(session.id);
-    } catch (error) {
-      console.error("Failed to expire unusable Stripe session:", error);
-    }
+    await expireSession(gateway, session.id, "unusable");
 
     return { ok: false, reason: "payment_unavailable" };
   }
 
-  const recorded = recordCheckoutSession(db, prepared.context, session);
+  if (points > 0 && loyalty) {
+    return debitPointsAndRecord(db, gateway, loyalty, context, session);
+  }
+
+  const recorded = recordCheckoutSession(db, context, session);
 
   if (!recorded.ok) {
-    try {
-      await gateway.expireCheckoutSession(session.id);
-    } catch (error) {
-      console.error("Failed to expire rejected Stripe session:", error);
-    }
+    await expireSession(gateway, session.id, "rejected");
   }
 
   return recorded;
@@ -663,18 +874,27 @@ export function purchaseReservation(
         reservation.expiresAt.getTime() <= now.getTime()
       ) {
         if (reservation.status !== "expired") {
-          tx.update(reservations)
-            .set({ status: "expired" })
-            .where(
-              and(
-                eq(reservations.id, reservationId),
-                eq(reservations.status, "held"),
-              ),
-            )
-            .run();
+          expireHold(tx, reservationId, now);
         }
 
         return { ok: false, reason: "reservation_expired" };
+      }
+
+      // The legacy flow neither uses nor awards points: give back any points
+      // locked by an open checkout attempt.
+      const openAttempt = tx
+        .select()
+        .from(payments)
+        .where(
+          and(
+            eq(payments.reservationId, reservationId),
+            eq(payments.status, "pending"),
+          ),
+        )
+        .get();
+
+      if (openAttempt) {
+        releasePaymentPoints(tx, openAttempt, now);
       }
 
       for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
@@ -683,7 +903,13 @@ export function purchaseReservation(
         try {
           const updated = tx
             .update(reservations)
-            .set({ status: "paid", code, purchasedAt: now })
+            .set({
+              status: "paid",
+              code,
+              purchasedAt: now,
+              pointsUsed: 0,
+              pointsEarned: 0,
+            })
             .where(
               and(
                 eq(reservations.id, reservationId),
@@ -713,10 +939,7 @@ export function purchaseReservation(
           }
 
           if (current?.status === "held") {
-            tx.update(reservations)
-              .set({ status: "expired" })
-              .where(eq(reservations.id, reservationId))
-              .run();
+            expireHold(tx, reservationId, now);
 
             return { ok: false, reason: "reservation_expired" };
           }

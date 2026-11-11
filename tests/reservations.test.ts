@@ -407,6 +407,8 @@ describe("getReservationState", () => {
       amount: duneEvent.price,
       expiresAt: created.expiresAt,
       code: null,
+      pointsUsed: 0,
+      pointsEarned: null,
     });
   });
 
@@ -435,6 +437,8 @@ describe("getReservationState", () => {
       amount: duneEvent.price,
       expiresAt: created.expiresAt,
       code: purchased.code,
+      pointsUsed: 0,
+      pointsEarned: 0,
     });
   });
 
@@ -561,6 +565,7 @@ describe("startCheckout", () => {
       {
         reservationId: hold.reservationId,
         amount: duneEvent.price,
+        pointsUsed: 0,
         customerEmail: "ada@example.com",
         seatId: "A2",
         eventTitle: duneEvent.title,

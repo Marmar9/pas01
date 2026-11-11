@@ -411,9 +411,13 @@ describe("processStripeEvent", () => {
       .where(eq(payments.stripeCheckoutSessionId, "cs_test_2"))
       .get();
 
-    expect(db.select({ id: jobs.id }).from(jobs).all()).toEqual([
-      { id: refundJobId(secondPayment?.id ?? "") },
-    ]);
+    expect(
+      db
+        .select({ id: jobs.id })
+        .from(jobs)
+        .where(eq(jobs.task, "refund-payment"))
+        .all(),
+    ).toEqual([{ id: refundJobId(secondPayment?.id ?? "") }]);
   });
 
   test("does not refund when the same session is reported paid twice", () => {
@@ -438,7 +442,9 @@ describe("processStripeEvent", () => {
     );
 
     expect(db.select().from(payments).all()).toHaveLength(1);
-    expect(db.select().from(jobs).all()).toHaveLength(0);
+    expect(
+      db.select().from(jobs).where(eq(jobs.task, "refund-payment")).all(),
+    ).toHaveLength(0);
   });
 
   test("never turns a refunded payment back into paid", () => {
