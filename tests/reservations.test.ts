@@ -896,7 +896,25 @@ describe("getPaidTicketByCode", () => {
       code: purchase.code,
       eventId: duneEvent.id,
       seatId: "C3",
+      amount: 3200,
+      pointsUsed: 0,
+      pointsEarned: 0,
     });
+
+    db.update(reservations)
+      .set({ pointsUsed: 1000, pointsEarned: 220 })
+      .where(eq(reservations.code, purchase.code))
+      .run();
+
+    expect(getPaidTicketByCode(db, purchase.code)).toEqual({
+      code: purchase.code,
+      eventId: duneEvent.id,
+      seatId: "C3",
+      amount: 3200,
+      pointsUsed: 1000,
+      pointsEarned: 220,
+    });
+
     expect(getPaidTicketByCode(db, "NOSUCHCODE")).toBeNull();
   });
 });
