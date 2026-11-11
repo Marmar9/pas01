@@ -6,10 +6,17 @@ import {
   ApiError,
   createReservation,
   type EventDto,
+  getLoyalty,
   getReservation,
   startCheckout,
 } from "@/lib/client-api";
 import { formatCountdown, formatEventDate, formatPrice } from "@/lib/format";
+import {
+  cardAmountFor,
+  clampPoints,
+  formatPoints,
+  maxSpendablePoints,
+} from "@/lib/loyalty-points";
 import { storeReservationMeta } from "@/lib/reservation-meta";
 
 type ReserveFormProps = {
@@ -25,7 +32,14 @@ type Hold = {
   expiresAt: number;
 };
 
+type LoyaltyState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "unavailable" }
+  | { status: "ready"; balance: number };
+
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const LOYALTY_DEBOUNCE_MS = 400;
 
 export function ReserveForm({ event, seatId }: ReserveFormProps) {
   const router = useRouter();
@@ -41,10 +55,54 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
   const [hold, setHold] = useState<Hold | null>(null);
   const [remainingMs, setRemainingMs] = useState(0);
   const [expired, setExpired] = useState(false);
+  const [loyalty, setLoyalty] = useState<LoyaltyState>({ status: "idle" });
+  const [pointsInput, setPointsInput] = useState(0);
+
+  const amount = hold?.amount ?? event.price;
+  const maxPoints =
+    loyalty.status === "ready"
+      ? maxSpendablePoints(amount, loyalty.balance)
+      : 0;
 
   useEffect(() => {
     idempotencyKey.current = crypto.randomUUID();
   }, []);
+
+  useEffect(() => {
+    const normalized = email.trim();
+
+    if (!EMAIL_PATTERN.test(normalized)) {
+      setLoyalty({ status: "idle" });
+      setPointsInput(0);
+      return;
+    }
+
+    let cancelled = false;
+    setLoyalty({ status: "loading" });
+
+    const timer = window.setTimeout(() => {
+      getLoyalty(normalized)
+        .then((balance) => {
+          if (!cancelled) {
+            setLoyalty({ status: "ready", balance: balance.points });
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLoyalty({ status: "unavailable" });
+          }
+        });
+    }, LOYALTY_DEBOUNCE_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [email]);
+
+  useEffect(() => {
+    setPointsInput((current) => clampPoints(current, maxPoints));
+  }, [maxPoints]);
 
   useEffect(() => {
     if (lockedUntil === 0) {
@@ -109,7 +167,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
   }
 
   async function startPayment(activeHold: Hold) {
-    const checkout = await startCheckout(activeHold.reservationId);
+    const checkout = await startCheckout(activeHold.reservationId, pointsInput);
 
     storeReservationMeta(activeHold.reservationId, {
       eventId: event.id,
@@ -176,7 +234,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
       try {
         await startPayment(hold);
       } catch (error) {
-        handleError(error);
+        await handleError(error);
       } finally {
         setPending(false);
       }
@@ -193,7 +251,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
     try {
       await createHold();
     } catch (error) {
-      handleError(error);
+      await handleError(error);
     } finally {
       setPending(false);
     }
@@ -213,13 +271,13 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
     try {
       await createHold();
     } catch (error) {
-      handleError(error);
+      await handleError(error);
     } finally {
       setPending(false);
     }
   }
 
-  function handleError(error: unknown) {
+  async function handleError(error: unknown) {
     if (!(error instanceof ApiError)) {
       setFormError("Coś poszło nie tak. Spróbuj ponownie za chwilę.");
       return;
@@ -288,6 +346,44 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
           "Płatności online są chwilowo niedostępne. Spróbuj ponownie za chwilę.",
         );
         break;
+      case "INSUFFICIENT_POINTS": {
+        try {
+          const balance = await getLoyalty(email.trim());
+          setLoyalty({ status: "ready", balance: balance.points });
+          setPointsInput((current) =>
+            clampPoints(
+              current,
+              maxSpendablePoints(hold?.amount ?? event.price, balance.points),
+            ),
+          );
+          setFormError(
+            "Saldo punktów się zmieniło. Sprawdziliśmy je ponownie — potwierdź kwotę.",
+          );
+        } catch {
+          setLoyalty({ status: "unavailable" });
+          setPointsInput(0);
+          setFormError(
+            "Program lojalnościowy jest chwilowo niedostępny. Możesz zapłacić kartą.",
+          );
+        }
+        break;
+      }
+      case "POINTS_LIMIT_EXCEEDED":
+        setPointsInput((current) => clampPoints(current, maxPoints));
+        setFormError("Punktami można pokryć najwyżej połowę biletu.");
+        break;
+      case "CHECKOUT_IN_PROGRESS":
+        setFormError(
+          "Trwa już płatność z innym podziałem punktów. Dokończ ją lub spróbuj ponownie bez zmiany punktów.",
+        );
+        break;
+      case "LOYALTY_UNAVAILABLE":
+        setLoyalty({ status: "unavailable" });
+        setPointsInput(0);
+        setFormError(
+          "Program lojalnościowy jest chwilowo niedostępny. Możesz zapłacić kartą.",
+        );
+        break;
       case "RESERVATION_NOT_FOUND":
         setHold(null);
         idempotencyKey.current = crypto.randomUUID();
@@ -305,6 +401,8 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
 
   const inputClass =
     "mt-2 w-full rounded-xl border border-white/10 bg-ink/60 px-4 py-3 text-sm text-white placeholder:text-zinc-600 transition-colors focus:border-secondary/60 focus:outline-none read-only:opacity-70";
+  const pointsInputClass =
+    "w-full rounded-xl border border-white/10 bg-ink/60 px-4 py-3 text-sm text-white transition-colors focus:border-secondary/60 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50";
 
   return (
     <div className="space-y-5">
@@ -351,8 +449,9 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
             <span className="font-mono text-base font-bold text-secondary">
               {formatCountdown(remainingMs)}
             </span>
-            . Kliknij „Zapłać {formatPrice(hold.amount)}”, aby przejść do
-            płatności Stripe.
+            . Kliknij „Zapłać{" "}
+            {formatPrice(cardAmountFor(hold.amount, pointsInput))}”, aby przejść
+            do płatności Stripe.
           </p>
         ) : null}
       </div>
@@ -438,6 +537,9 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
               readOnly={fieldsLocked || pending}
               onChange={(changeEvent) => {
                 setEmail(changeEvent.target.value);
+                setLoyalty({ status: "idle" });
+                setPointsInput(0);
+                setFormError(null);
                 setFieldErrors((current) => ({
                   ...current,
                   email: undefined,
@@ -459,6 +561,92 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
                 : "Po opłaceniu zobaczysz bilet z kodem na ekranie."}
             </p>
           </div>
+
+          {loyalty.status === "loading" ? (
+            <p className="text-xs text-zinc-500">
+              Sprawdzamy punkty lojalnościowe…
+            </p>
+          ) : null}
+
+          {loyalty.status === "ready" && maxPoints > 0 ? (
+            <div className="rounded-xl border border-secondary/20 bg-secondary/5 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label
+                  htmlFor="points"
+                  className="text-sm font-semibold text-white"
+                >
+                  Użyj punktów
+                </label>
+                <span className="text-xs text-zinc-400">
+                  Masz {formatPoints(loyalty.balance)}
+                </span>
+              </div>
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                <input
+                  id="points"
+                  name="points"
+                  type="number"
+                  min={0}
+                  max={maxPoints}
+                  step={1}
+                  inputMode="numeric"
+                  value={pointsInput}
+                  disabled={pending}
+                  onChange={(changeEvent) =>
+                    setPointsInput(
+                      clampPoints(Number(changeEvent.target.value), maxPoints),
+                    )
+                  }
+                  className={pointsInputClass}
+                />
+                <button
+                  type="button"
+                  onClick={() => setPointsInput(maxPoints)}
+                  disabled={pending}
+                  className="btn-ghost justify-center whitespace-nowrap px-4 py-3 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Użyj maks.
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-zinc-500">
+                Możesz wykorzystać maksymalnie {formatPoints(maxPoints)}
+                {" (1 pkt = 1 gr)."}
+              </p>
+              <dl className="mt-4 space-y-2 border-t border-white/10 pt-4 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-zinc-400">Cena biletu</dt>
+                  <dd className="font-semibold text-white">
+                    {formatPrice(amount)}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-zinc-400">Punkty</dt>
+                  <dd className="font-semibold text-secondary">
+                    −{formatPrice(pointsInput)}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                  <dt className="font-semibold text-white">Do zapłaty kartą</dt>
+                  <dd className="font-semibold text-secondary">
+                    {formatPrice(cardAmountFor(amount, pointsInput))}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          ) : null}
+
+          {loyalty.status === "ready" && maxPoints === 0 ? (
+            <p className="rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-xs text-zinc-400">
+              Brak punktów do wykorzystania — zapłacisz kartą.
+            </p>
+          ) : null}
+
+          {loyalty.status === "unavailable" ? (
+            <p className="rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-xs text-zinc-400">
+              Program lojalnościowy jest chwilowo niedostępny. Możesz zapłacić
+              kartą.
+            </p>
+          ) : null}
 
           {formError ? (
             <div
@@ -496,7 +684,7 @@ export function ReserveForm({ event, seatId }: ReserveFormProps) {
             ) : locked ? (
               `Poczekaj ${secondsLeft} s`
             ) : hold ? (
-              `Zapłać ${formatPrice(hold.amount)}`
+              `Zapłać ${formatPrice(cardAmountFor(hold.amount, pointsInput))}`
             ) : (
               <>
                 Zarezerwuj miejsce
