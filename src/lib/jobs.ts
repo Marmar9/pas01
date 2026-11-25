@@ -11,6 +11,18 @@ const MAX_JOBS_PER_RUN = 50;
 export type JobHandler = (job: JobRow) => Promise<void>;
 export type JobHandlers = Partial<Record<JobTask, JobHandler>>;
 
+/**
+ * A failure that no retry can fix (e.g. a 4xx refusal from Voucherify or
+ * Resend). The job is dead-lettered at once instead of spending the remaining
+ * attempts (and the provider's rate-limit budget) on a guaranteed failure.
+ */
+export class PermanentJobError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentJobError";
+  }
+}
+
 export function retryDelayMs(totalTried: number): number {
   return Math.min(300, 2 ** totalTried * 5) * 1000;
 }
@@ -77,7 +89,10 @@ export function failJob(
 ): void {
   const lastError = error instanceof Error ? error.message : String(error);
 
-  if (job.totalTried >= MAX_JOB_ATTEMPTS) {
+  if (
+    job.totalTried >= MAX_JOB_ATTEMPTS ||
+    error instanceof PermanentJobError
+  ) {
     // Dead letter: stop retrying a poison job and leave it for a human.
     db.update(jobs)
       .set({ hasError: true, lastError })

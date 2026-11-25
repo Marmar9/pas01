@@ -167,7 +167,12 @@ export const stripeEvents = sqliteTable(
   ],
 );
 
-export const LOYALTY_OPERATION_TYPES = ["spend", "earn", "restore"] as const;
+export const LOYALTY_OPERATION_TYPES = [
+  "spend",
+  "earn",
+  "restore",
+  "welcome",
+] as const;
 export type LoyaltyOperationType = (typeof LOYALTY_OPERATION_TYPES)[number];
 
 export const LOYALTY_OPERATION_STATUSES = [
@@ -178,15 +183,18 @@ export const LOYALTY_OPERATION_STATUSES = [
 export type LoyaltyOperationStatus =
   (typeof LOYALTY_OPERATION_STATUSES)[number];
 
-// Local record of every Voucherify balance mutation. The id is the sourceId
-// sent to Voucherify, so retries are idempotent. It is never a balance source.
+// Local record of every Voucherify balance mutation. The id is the sourceId,
+// sent to Voucherify as the transaction reason; Voucherify does not
+// deduplicate, so this row is what makes retries idempotent. It is never a
+// balance source.
 export const loyaltyOperations = sqliteTable(
   "loyalty_operations",
   {
     id: text("id").primaryKey(),
-    reservationId: text("reservation_id")
-      .notNull()
-      .references(() => reservations.id, { onDelete: "cascade" }),
+    // Null for the welcome credit, which belongs to no reservation.
+    reservationId: text("reservation_id").references(() => reservations.id, {
+      onDelete: "cascade",
+    }),
     // No foreign key: a spend is recorded before its payment row exists.
     paymentId: text("payment_id"),
     type: text("type").$type<LoyaltyOperationType>().notNull(),
@@ -195,6 +203,9 @@ export const loyaltyOperations = sqliteTable(
       .$type<LoyaltyOperationStatus>()
       .notNull()
       .default("pending"),
+    // Voucherify card transaction id (lctx_...), known once the adjustment
+    // was accepted; its PENDING/APPROVED/REJECTED status settles the row.
+    voucherifyTransactionId: text("voucherify_transaction_id"),
     createdAt: integer("created_at", { mode: "timestamp_ms" })
       .notNull()
       .default(sql`(unixepoch() * 1000)`),
@@ -207,7 +218,7 @@ export const loyaltyOperations = sqliteTable(
     index("loyalty_operations_payment_id_idx").on(table.paymentId),
     check(
       "loyalty_operations_type_check",
-      sql`${table.type} in ('spend', 'earn', 'restore')`,
+      sql`${table.type} in ('spend', 'earn', 'restore', 'welcome')`,
     ),
     check(
       "loyalty_operations_status_check",
@@ -221,6 +232,8 @@ export const JOB_TASKS = [
   "credit-points",
   "restore-points",
   "send-ticket-email",
+  "expire-checkout-session",
+  "credit-welcome-points",
 ] as const;
 export type JobTask = (typeof JOB_TASKS)[number];
 

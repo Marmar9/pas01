@@ -1,12 +1,14 @@
 import { getDb } from "@/db/client";
+import { createExpireSessionHandler } from "./checkout-compensation";
 import { sweepExpiredHolds } from "./holds";
 import { type JobHandlers, runDueJobs } from "./jobs";
 import {
   createCreditPointsHandler,
   createRestorePointsHandler,
+  createWelcomePointsHandler,
 } from "./loyalty";
 import { createRefundHandler } from "./refunds";
-import { getStripeRefundGateway } from "./stripe";
+import { getStripeCheckoutGateway, getStripeRefundGateway } from "./stripe";
 import { createTicketEmailHandler, getResendGateway } from "./ticket-email";
 import { getVoucherifyGateway } from "./voucherify";
 
@@ -20,8 +22,15 @@ function jobHandlers(): JobHandlers {
   return {
     "refund-payment": createRefundHandler(getDb(), getStripeRefundGateway),
     "credit-points": createCreditPointsHandler(getDb(), getVoucherifyGateway),
+    "credit-welcome-points": createWelcomePointsHandler(
+      getDb(),
+      getVoucherifyGateway,
+    ),
     "restore-points": createRestorePointsHandler(getDb(), getVoucherifyGateway),
     "send-ticket-email": createTicketEmailHandler(getDb(), getResendGateway),
+    "expire-checkout-session": createExpireSessionHandler(
+      getStripeCheckoutGateway,
+    ),
   };
 }
 

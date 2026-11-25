@@ -9,8 +9,13 @@ import {
   type ReservationStatus,
   reservations,
 } from "@/db/schema";
+import {
+  enqueueExpireSession,
+  expireSessionNow,
+} from "./checkout-compensation";
 import { expireHold, reconcileOrphanSpends } from "./holds";
 import {
+  APPROVAL_POLL_DELAYS_MS,
   applyLoyaltyOperation,
   enqueueRestorePoints,
   getLoyaltyBalance,
@@ -84,6 +89,8 @@ export type StartCheckoutOptions = {
   // undefined when the request body did not supply points.
   points?: number;
   loyalty?: LoyaltyGateway | null;
+  // How long to wait for Voucherify to APPROVE the debit before giving up.
+  approvalDelaysMs?: readonly number[];
 };
 
 // session.amount is the card amount (reservation amount minus points).
@@ -658,8 +665,9 @@ function recordCheckoutSession(
 }
 
 // Records an attempt that will never be payable, so the attempt counter (and
-// with it the Stripe idempotency key) advances. restorePoints is set when the
-// debit happened or its outcome is still unknown.
+// with it the Stripe idempotency key) advances. In the same transaction the
+// saga's compensations are queued: expiring the Stripe session and, when the
+// debit happened or its outcome is still unknown, restoring the points.
 function recordFailedAttempt(
   db: Db,
   context: CheckoutContext,
@@ -686,6 +694,7 @@ function recordFailedAttempt(
         })
         .onConflictDoNothing()
         .run();
+      enqueueExpireSession(tx, session.id, now);
 
       if (restorePoints) {
         enqueueRestorePoints(tx, context.paymentId, now);
@@ -695,25 +704,16 @@ function recordFailedAttempt(
   );
 }
 
-async function expireSession(
-  gateway: CheckoutGateway,
-  sessionId: string,
-  why: string,
-): Promise<void> {
-  try {
-    await gateway.expireCheckoutSession(sessionId);
-  } catch (error) {
-    console.error(`Failed to expire ${why} Stripe session:`, error);
-  }
-}
-
 async function debitPointsAndRecord(
   db: Db,
   gateway: CheckoutGateway,
   loyalty: LoyaltyGateway,
   context: CheckoutContext,
   session: { id: string; url: string | null },
+  approvalDelaysMs: readonly number[],
 ): Promise<StartCheckoutResult> {
+  // The URL is handed out only for an APPROVED debit; a REJECTED one is a
+  // refusal and one still PENDING after the wait is abandoned (compensated).
   const spend = await applyLoyaltyOperation(
     db,
     loyalty,
@@ -725,7 +725,7 @@ async function debitPointsAndRecord(
       points: context.session.pointsUsed,
       email: context.session.customerEmail,
     },
-    { reconcileNow: true },
+    { reconcileNow: true, approvalDelaysMs },
   );
   // A concurrent request for the same session may have recorded the spend
   // first; its payment id is the one the restore job keys on.
@@ -741,7 +741,7 @@ async function debitPointsAndRecord(
       console.error("Failed to record a failed points checkout:", error);
     }
 
-    await expireSession(gateway, session.id, "unpaid points");
+    await expireSessionNow(db, gateway, session.id);
 
     return {
       ok: false,
@@ -770,7 +770,7 @@ async function debitPointsAndRecord(
       console.error("Failed to record a rejected points checkout:", error);
     }
 
-    await expireSession(gateway, session.id, "rejected");
+    await expireSessionNow(db, gateway, session.id);
   }
 
   return recorded;
@@ -808,7 +808,12 @@ export async function startCheckout(
     let balance: number;
 
     try {
-      balance = await getLoyaltyBalance(loyalty, context.session.customerEmail);
+      balance = await getLoyaltyBalance(
+        db,
+        loyalty,
+        context.session.customerEmail,
+        { approvalDelaysMs: options.approvalDelaysMs },
+      );
     } catch (error) {
       console.error(
         "Failed to read the loyalty balance:",
@@ -832,19 +837,26 @@ export async function startCheckout(
   }
 
   if (!session.url) {
-    await expireSession(gateway, session.id, "unusable");
+    await expireSessionNow(db, gateway, session.id);
 
     return { ok: false, reason: "payment_unavailable" };
   }
 
   if (points > 0 && loyalty) {
-    return debitPointsAndRecord(db, gateway, loyalty, context, session);
+    return debitPointsAndRecord(
+      db,
+      gateway,
+      loyalty,
+      context,
+      session,
+      options.approvalDelaysMs ?? APPROVAL_POLL_DELAYS_MS,
+    );
   }
 
   const recorded = recordCheckoutSession(db, context, session);
 
   if (!recorded.ok) {
-    await expireSession(gateway, session.id, "rejected");
+    await expireSessionNow(db, gateway, session.id);
   }
 
   return recorded;
@@ -903,6 +915,7 @@ export function purchaseReservation(
         .get();
 
       if (openAttempt) {
+        enqueueExpireSession(tx, openAttempt.stripeCheckoutSessionId, now);
         releasePaymentPoints(tx, openAttempt, now);
       }
 

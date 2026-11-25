@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { jobs, payments, reservations, stripeEvents } from "@/db/schema";
+import { expireSessionJobId } from "@/lib/checkout-compensation";
 import { processStripeEvent } from "@/lib/payments";
 import { refundJobId } from "@/lib/refunds";
-import { createReservation } from "@/lib/reservations";
+import { createReservation, purchaseReservation } from "@/lib/reservations";
 import { createTestDb, duneEvent, seedTestEvents } from "./helpers";
 
 type TestDb = ReturnType<typeof createTestDb>;
@@ -447,6 +448,78 @@ describe("processStripeEvent", () => {
     ).toHaveLength(0);
   });
 
+  test("refunds a session paid after the legacy purchase issued the ticket", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    insertPendingPayment(db, hold.reservationId, "cs_test_open");
+
+    const purchased = purchaseReservation(db, hold.reservationId);
+    expect(
+      db
+        .select({ id: jobs.id })
+        .from(jobs)
+        .where(eq(jobs.task, "expire-checkout-session"))
+        .all(),
+    ).toEqual([{ id: expireSessionJobId("cs_test_open") }]);
+
+    expect(
+      processStripeEvent(
+        db,
+        stripeEvent(
+          "checkout.session.completed",
+          checkoutSession({
+            id: "cs_test_open",
+            client_reference_id: hold.reservationId,
+          }),
+        ),
+      ),
+    ).toEqual({ ok: true });
+
+    const payment = db.select().from(payments).get();
+    expect(db.select().from(reservations).get()?.code).toBe(
+      purchased.ok ? purchased.code : "",
+    );
+    expect(
+      db
+        .select({ id: jobs.id })
+        .from(jobs)
+        .where(eq(jobs.task, "refund-payment"))
+        .all(),
+    ).toEqual([{ id: refundJobId(payment?.id ?? "") }]);
+  });
+
+  test("refunds a paid attempt that checkout already abandoned", () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    insertPendingPayment(db, hold.reservationId, "cs_test_abandoned");
+    db.update(payments).set({ status: "failed" }).run();
+
+    expect(
+      processStripeEvent(
+        db,
+        stripeEvent(
+          "checkout.session.completed",
+          checkoutSession({
+            id: "cs_test_abandoned",
+            client_reference_id: hold.reservationId,
+          }),
+        ),
+      ),
+    ).toEqual({ ok: false, reason: "payment_abandoned", permanent: true });
+
+    const payment = db.select().from(payments).get();
+    expect(payment?.status).toBe("paid");
+    expect(db.select().from(reservations).get()).toMatchObject({
+      status: "held",
+      code: null,
+    });
+    expect(db.select({ id: jobs.id }).from(jobs).all()).toEqual([
+      { id: refundJobId(payment?.id ?? "") },
+    ]);
+  });
+
   test("never turns a refunded payment back into paid", () => {
     const db = createTestDb();
     seedTestEvents(db);
@@ -651,7 +724,10 @@ describe("processStripeEvent", () => {
       db,
       stripeEvent(
         "checkout.session.expired",
-        checkoutSession({ id: "cs_test_paid", payment_status: "unpaid" }),
+        checkoutSession({
+          id: "cs_test_paid",
+          payment_status: "unpaid",
+        }),
         "evt_late_expiry",
       ),
     );
@@ -685,7 +761,9 @@ describe("processStripeEvent", () => {
 
     const result = processStripeEvent(
       db,
-      stripeEvent("checkout.session.completed", { object: "payment_intent" }),
+      stripeEvent("checkout.session.completed", {
+        object: "payment_intent",
+      }),
     );
 
     expect(result).toEqual({

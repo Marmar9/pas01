@@ -105,7 +105,13 @@ export function createStripeCheckoutGateway(stripe: Stripe): CheckoutGateway {
     },
 
     async expireCheckoutSession(sessionId) {
-      await stripe.checkout.sessions.expire(sessionId);
+      // Idempotent compensation: only an open session can be expired; a
+      // completed one is settled (and refunded if needed) by the webhook.
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+      if (session.status === "open") {
+        await stripe.checkout.sessions.expire(sessionId);
+      }
     },
   };
 }

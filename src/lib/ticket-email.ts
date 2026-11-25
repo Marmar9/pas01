@@ -3,7 +3,7 @@ import { Resend } from "resend";
 import type { Db } from "@/db/client";
 import { events, reservations } from "@/db/schema";
 import { formatEventDate, formatPrice } from "./format";
-import { enqueueJob, type JobHandler } from "./jobs";
+import { enqueueJob, type JobHandler, PermanentJobError } from "./jobs";
 import { getAppUrl } from "./stripe";
 
 const DEFAULT_FROM = "onboarding@resend.dev";
@@ -138,14 +138,41 @@ export function createResendGateway(
       );
 
       if (error) {
-        throw new Error(
-          `Resend rejected the ticket email (${error.name}, ${
-            error.statusCode ?? "no status"
-          }).`,
-        );
+        const message = `Resend rejected the ticket email (${error.name}, ${
+          error.statusCode ?? "no status"
+        }).`;
+
+        // A sent email cannot be compensated and the ticket stays on the
+        // ticket page, so a refusal no retry can fix (validation, test-mode
+        // recipient, invalid key) is dead-lettered at once. Rate limits,
+        // quotas and a concurrent request with the same idempotency key are
+        // retried.
+        throw isPermanentResendError(error.statusCode, error.name)
+          ? new PermanentJobError(message)
+          : new Error(message);
       }
     },
   };
+}
+
+const RETRYABLE_RESEND_ERRORS = new Set([
+  "rate_limit_exceeded",
+  "daily_quota_exceeded",
+  "monthly_quota_exceeded",
+  "concurrent_idempotent_requests",
+]);
+
+export function isPermanentResendError(
+  statusCode: number | null,
+  name: string,
+): boolean {
+  return (
+    statusCode !== null &&
+    statusCode >= 400 &&
+    statusCode < 500 &&
+    statusCode !== 429 &&
+    !RETRYABLE_RESEND_ERRORS.has(name)
+  );
 }
 
 let resendGateway: EmailGateway | null = null;
