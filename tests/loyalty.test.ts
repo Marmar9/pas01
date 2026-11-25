@@ -3,22 +3,34 @@ import { eq } from "drizzle-orm";
 import { GET as loyaltyRoute } from "@/app/api/loyalty/route";
 import { POST as checkoutRoute } from "@/app/api/reservations/[id]/checkout/route";
 import { jobs, loyaltyOperations, payments, reservations } from "@/db/schema";
+import {
+  createExpireSessionHandler,
+  expireSessionJobId,
+  expireSessionNow,
+} from "@/lib/checkout-compensation";
 import { sweepExpiredHolds } from "@/lib/holds";
 import { runDueJobs } from "@/lib/jobs";
 import {
   createCreditPointsHandler,
   createRestorePointsHandler,
+  createWelcomePointsHandler,
   creditPointsJobId,
   earnSourceId,
   getLoyaltyBalance,
+  LOYALTY_SETTLE_MS,
   LoyaltyError,
   type LoyaltyGateway,
+  type LoyaltyTransaction,
   maxPointsForAmount,
   pointsEarnedFor,
+  recordWelcomePoints,
   resetLoyaltyState,
   restorePointsJobId,
   restoreSourceId,
   spendSourceId,
+  WELCOME_POINTS,
+  welcomePointsJobId,
+  welcomeSourceId,
 } from "@/lib/loyalty";
 import { processStripeEvent } from "@/lib/payments";
 import {
@@ -30,6 +42,7 @@ import type { CheckoutGateway, CheckoutSessionInput } from "@/lib/stripe";
 import {
   buildTicketEmail,
   createTicketEmailHandler,
+  isPermanentResendError,
   type TicketEmailMessage,
   ticketEmailJobId,
 } from "@/lib/ticket-email";
@@ -97,17 +110,55 @@ function fakeStripe() {
   return { gateway, created, expired };
 }
 
+type FakeTransaction = LoyaltyTransaction & { reason: string; points: number };
+
+// Models Loyalty v2: every change is accepted as PENDING and settled later.
+// With autoApprove the fake settles it at once; otherwise settle() does.
 function fakeLoyalty(initialBalance = 1000) {
   const state = {
     balance: initialBalance,
     reads: 0,
+    lookups: 0,
     adjustments: [] as Array<{ points: number; sourceId: string }>,
-    transactions: new Set<string>(),
+    transactions: [] as FakeTransaction[],
     failNext: null as LoyaltyError | null,
+    autoApprove: true,
+    onRead: null as ((email: string) => void) | null,
   };
+
+  function settle(transaction: FakeTransaction) {
+    if (transaction.status !== "pending") {
+      return;
+    }
+
+    if (state.balance + transaction.points < 0) {
+      transaction.status = "rejected";
+      transaction.insufficientPoints = true;
+      return;
+    }
+
+    state.balance += transaction.points;
+    transaction.status = "approved";
+  }
+
+  // A change Voucherify applied although our call never got the answer.
+  function record(sourceId: string, points: number) {
+    const transaction: FakeTransaction = {
+      id: `lctx_${state.transactions.length + 1}`,
+      status: "pending",
+      insufficientPoints: false,
+      reason: sourceId,
+      points,
+    };
+    state.transactions.push(transaction);
+    settle(transaction);
+    return transaction;
+  }
+
   const gateway: LoyaltyGateway = {
-    async getBalance() {
+    async getBalance(email) {
       state.reads += 1;
+      state.onRead?.(email);
       return state.balance;
     },
     async adjustBalance({ points, sourceId }) {
@@ -119,19 +170,40 @@ function fakeLoyalty(initialBalance = 1000) {
         throw error;
       }
 
-      if (state.balance + points < 0) {
-        throw new LoyaltyError("insufficient_points", "Not enough points.");
+      const transaction: FakeTransaction = {
+        id: `lctx_${state.transactions.length + 1}`,
+        status: "pending",
+        insufficientPoints: false,
+        reason: sourceId,
+        points,
+      };
+      state.transactions.push(transaction);
+
+      if (state.autoApprove) {
+        settle(transaction);
       }
 
-      state.balance += points;
-      state.transactions.add(sourceId);
+      return { ...transaction };
     },
-    async hasTransaction({ sourceId }) {
-      return state.transactions.has(sourceId);
+    async findTransaction({ sourceId, transactionId }) {
+      state.lookups += 1;
+      const match = transactionId
+        ? state.transactions.find((candidate) => candidate.id === transactionId)
+        : state.transactions.find(
+            (candidate) =>
+              candidate.reason === sourceId && candidate.status !== "rejected",
+          );
+
+      return match ? { ...match } : null;
     },
   };
 
-  return { gateway, state };
+  return {
+    gateway,
+    state,
+    record,
+    settleAll: () => state.transactions.forEach(settle),
+  };
 }
 
 function paidSession(
@@ -175,20 +247,22 @@ describe("loyalty rules", () => {
   });
 
   test("caches balances and coalesces concurrent reads", async () => {
+    const db = createTestDb();
     const { gateway, state } = fakeLoyalty(1000);
     let now = 0;
+    const options = { now: () => now };
 
     const [first, second] = await Promise.all([
-      getLoyaltyBalance(gateway, EMAIL, () => now),
-      getLoyaltyBalance(gateway, ` ${EMAIL.toUpperCase()} `, () => now),
+      getLoyaltyBalance(db, gateway, EMAIL, options),
+      getLoyaltyBalance(db, gateway, ` ${EMAIL.toUpperCase()} `, options),
     ]);
-    await getLoyaltyBalance(gateway, EMAIL, () => now);
+    await getLoyaltyBalance(db, gateway, EMAIL, options);
 
     expect([first, second]).toEqual([1000, 1000]);
     expect(state.reads).toBe(1);
 
     now = 60_000;
-    await getLoyaltyBalance(gateway, EMAIL, () => now);
+    await getLoyaltyBalance(db, gateway, EMAIL, options);
     expect(state.reads).toBe(2);
   });
 });
@@ -307,14 +381,25 @@ describe("checkout with points", () => {
       }),
     ).toEqual({ ok: false, reason: "loyalty_unavailable" });
     expect(stripe.expired).toEqual(["cs_points_1"]);
-    expect(db.select().from(payments).get()).toMatchObject({
-      status: "failed",
-      pointsUsed: 1000,
-    });
-    expect(db.select().from(loyaltyOperations).get()?.status).toBe("failed");
+    const payment = db.select().from(payments).get();
+    expect(payment).toMatchObject({ status: "failed", pointsUsed: 1000 });
+    // A debit not visible yet may still land: the restore job settles it.
+    expect(db.select().from(loyaltyOperations).get()?.status).toBe("pending");
     expect(readReservation(db, hold.reservationId)?.pointsUsed).toBe(0);
-    // The reconciled failure was never debited, so nothing is restored.
-    expect(jobIds(db)).toEqual([]);
+    expect(jobIds(db)).toEqual(
+      [
+        expireSessionJobId("cs_points_1"),
+        restorePointsJobId(payment?.id ?? ""),
+      ].sort(),
+    );
+    // The session was expired right away, so its compensation is acked.
+    expect(
+      db
+        .select()
+        .from(jobs)
+        .where(eq(jobs.id, expireSessionJobId("cs_points_1")))
+        .get()?.completedAt,
+    ).toBeInstanceOf(Date);
 
     expect(
       await startCheckout(db, hold.reservationId, stripe.gateway, {
@@ -325,6 +410,102 @@ describe("checkout with points", () => {
     expect(stripe.created.map((input) => input.idempotencyKey)).toEqual([
       `checkout:${hold.reservationId}:1`,
       `checkout:${hold.reservationId}:2`,
+    ]);
+  });
+
+  test("refuses the checkout when Voucherify rejects the debit", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    const stripe = fakeStripe();
+    const loyalty = fakeLoyalty(1000);
+
+    // The cached balance says 1000, but the points were spent elsewhere.
+    await getLoyaltyBalance(db, loyalty.gateway, EMAIL);
+    loyalty.state.balance = 200;
+
+    expect(
+      await startCheckout(db, hold.reservationId, stripe.gateway, {
+        points: 1000,
+        loyalty: loyalty.gateway,
+      }),
+    ).toEqual({ ok: false, reason: "insufficient_points" });
+    expect(stripe.expired).toEqual(["cs_points_1"]);
+    expect(db.select().from(loyaltyOperations).get()).toMatchObject({
+      status: "failed",
+      voucherifyTransactionId: "lctx_1",
+    });
+    expect(db.select().from(payments).get()?.status).toBe("failed");
+    // A rejected debit took nothing, so there is nothing to restore.
+    expect(jobIds(db)).toEqual([expireSessionJobId("cs_points_1")]);
+  });
+
+  test("waits for a pending debit to be approved before handing out the URL", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    const loyalty = fakeLoyalty(1000);
+    loyalty.state.autoApprove = false;
+    const lookup = loyalty.gateway.findTransaction;
+    loyalty.gateway.findTransaction = async (input) => {
+      loyalty.settleAll();
+      return lookup(input);
+    };
+
+    expect(
+      await startCheckout(db, hold.reservationId, fakeStripe().gateway, {
+        points: 1000,
+        loyalty: loyalty.gateway,
+        approvalDelaysMs: [0, 0],
+      }),
+    ).toMatchObject({ ok: true });
+    expect(loyalty.state.lookups).toBe(1);
+    expect(db.select().from(loyaltyOperations).get()?.status).toBe("done");
+  });
+
+  test("abandons a debit that is still pending and restores it once approved", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    const stripe = fakeStripe();
+    const loyalty = fakeLoyalty(1000);
+    loyalty.state.autoApprove = false;
+
+    expect(
+      await startCheckout(db, hold.reservationId, stripe.gateway, {
+        points: 1000,
+        loyalty: loyalty.gateway,
+        approvalDelaysMs: [0, 0],
+      }),
+    ).toEqual({ ok: false, reason: "loyalty_unavailable" });
+    expect(stripe.expired).toEqual(["cs_points_1"]);
+    expect(db.select().from(loyaltyOperations).get()).toMatchObject({
+      status: "pending",
+      voucherifyTransactionId: "lctx_1",
+    });
+
+    const handlers = {
+      "restore-points": createRestorePointsHandler(db, () => loyalty.gateway),
+    };
+    const restoreJob = () =>
+      db.select().from(jobs).where(eq(jobs.task, "restore-points")).get();
+
+    await runDueJobs(db, handlers);
+    expect(restoreJob()).toMatchObject({
+      completedAt: null,
+      totalTried: 1,
+    });
+
+    loyalty.settleAll();
+    loyalty.state.autoApprove = true;
+    db.update(jobs).set({ visibleAt: new Date() }).run();
+    await runDueJobs(db, handlers);
+
+    expect(restoreJob()?.completedAt).toBeInstanceOf(Date);
+    expect(loyalty.state.balance).toBe(1000);
+    expect(loyalty.state.adjustments).toEqual([
+      { points: -1000, sourceId: spendSourceId("cs_points_1") },
+      { points: 1000, sourceId: restoreSourceId("cs_points_1") },
     ]);
   });
 
@@ -520,6 +701,95 @@ describe("loyalty jobs", () => {
     expect(db.select().from(jobs).get()?.completedAt).toBeInstanceOf(Date);
   });
 
+  async function uncertainDebit(db: TestDb) {
+    const hold = createHold(db);
+    const loyalty = fakeLoyalty(1000);
+    loyalty.state.failNext = new LoyaltyError("uncertain", "timeout");
+
+    await startCheckout(db, hold.reservationId, fakeStripe().gateway, {
+      points: 1000,
+      loyalty: loyalty.gateway,
+    });
+
+    const handlers = {
+      "restore-points": createRestorePointsHandler(db, () => loyalty.gateway),
+    };
+    const restoreJob = () =>
+      db.select().from(jobs).where(eq(jobs.task, "restore-points")).get();
+
+    return { loyalty, handlers, restoreJob };
+  }
+
+  test("waits for an uncertain debit to settle before abandoning it", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { loyalty, handlers, restoreJob } = await uncertainDebit(db);
+
+    await runDueJobs(db, handlers);
+    expect(restoreJob()).toMatchObject({
+      completedAt: null,
+      totalTried: 1,
+    });
+
+    db.update(loyaltyOperations)
+      .set({ updatedAt: new Date(Date.now() - LOYALTY_SETTLE_MS) })
+      .run();
+    db.update(jobs).set({ visibleAt: new Date() }).run();
+    await runDueJobs(db, handlers);
+
+    expect(restoreJob()?.completedAt).toBeInstanceOf(Date);
+    expect(db.select().from(loyaltyOperations).get()?.status).toBe("failed");
+    expect(loyalty.state.adjustments).toHaveLength(1);
+  });
+
+  test("restores an uncertain debit that Voucherify applied late", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const { loyalty, handlers, restoreJob } = await uncertainDebit(db);
+
+    loyalty.record(spendSourceId("cs_points_1"), -1000);
+    await runDueJobs(db, handlers);
+
+    expect(restoreJob()?.completedAt).toBeInstanceOf(Date);
+    expect(loyalty.state.balance).toBe(1000);
+    expect(loyalty.state.adjustments.at(-1)).toEqual({
+      points: 1000,
+      sourceId: restoreSourceId("cs_points_1"),
+    });
+  });
+
+  test("dead-letters a permanent Voucherify refusal at once", async () => {
+    const db = createTestDb();
+    seedTestEvents(db);
+    const hold = createHold(db);
+    const loyalty = fakeLoyalty(0);
+    loyalty.state.failNext = new LoyaltyError("rejected", "HTTP 404");
+
+    processStripeEvent(db, {
+      id: "evt_rejected_credit",
+      type: "checkout.session.completed",
+      data: {
+        object: paidSession(hold.reservationId, {
+          amount_total: duneEvent.price,
+          metadata: { reservationId: hold.reservationId },
+        }),
+      },
+    });
+    await runDueJobs(db, {
+      "credit-points": createCreditPointsHandler(db, () => loyalty.gateway),
+      "send-ticket-email": async () => {},
+    });
+
+    expect(
+      db
+        .select()
+        .from(jobs)
+        .where(eq(jobs.id, creditPointsJobId(hold.reservationId)))
+        .get(),
+    ).toMatchObject({ hasError: true, totalTried: 1, completedAt: null });
+    expect(readReservation(db, hold.reservationId)?.status).toBe("paid");
+  });
+
   test("credits earned points once and retries while Voucherify is down", async () => {
     const db = createTestDb();
     seedTestEvents(db);
@@ -639,6 +909,17 @@ describe("loyalty jobs", () => {
     expect(readReservation(db, hold.reservationId)?.status).toBe("paid");
   });
 
+  test("dead-letters only Resend refusals that a retry cannot fix", () => {
+    expect(isPermanentResendError(422, "validation_error")).toBe(true);
+    expect(isPermanentResendError(403, "invalid_access")).toBe(true);
+    expect(isPermanentResendError(429, "rate_limit_exceeded")).toBe(false);
+    expect(isPermanentResendError(409, "concurrent_idempotent_requests")).toBe(
+      false,
+    );
+    expect(isPermanentResendError(500, "internal_server_error")).toBe(false);
+    expect(isPermanentResendError(null, "application_error")).toBe(false);
+  });
+
   test("builds the ticket email subject from the event", () => {
     expect(
       buildTicketEmail({
@@ -656,17 +937,156 @@ describe("loyalty jobs", () => {
   });
 });
 
+describe("welcome points", () => {
+  function newMember(db: TestDb, loyalty: ReturnType<typeof fakeLoyalty>) {
+    const enrolled = new Set<string>();
+    loyalty.state.balance = 0;
+    loyalty.state.onRead = (email) => {
+      if (!enrolled.has(email)) {
+        enrolled.add(email);
+        recordWelcomePoints(db, email);
+      }
+    };
+  }
+
+  test("credits the welcome points once for a member the app enrolls", async () => {
+    const db = createTestDb();
+    const loyalty = fakeLoyalty();
+    newMember(db, loyalty);
+    const options = { approvalDelaysMs: [] };
+
+    expect(await getLoyaltyBalance(db, loyalty.gateway, EMAIL, options)).toBe(
+      WELCOME_POINTS,
+    );
+    resetLoyaltyState();
+    expect(await getLoyaltyBalance(db, loyalty.gateway, EMAIL, options)).toBe(
+      WELCOME_POINTS,
+    );
+
+    expect(loyalty.state.adjustments).toEqual([
+      { points: WELCOME_POINTS, sourceId: welcomeSourceId(EMAIL) },
+    ]);
+    expect(
+      db
+        .select()
+        .from(jobs)
+        .where(eq(jobs.id, welcomePointsJobId(EMAIL)))
+        .get()?.completedAt,
+    ).toBeInstanceOf(Date);
+  });
+
+  test("credits the welcome points on a later read after the job was dead-lettered", async () => {
+    const db = createTestDb();
+    const loyalty = fakeLoyalty();
+    newMember(db, loyalty);
+    const handlers = {
+      "credit-welcome-points": createWelcomePointsHandler(
+        db,
+        () => loyalty.gateway,
+      ),
+    };
+
+    // The program was not ACTIVE: the read fails and the job gives up at once.
+    const read = loyalty.gateway.getBalance;
+    loyalty.gateway.getBalance = async (email) => {
+      await read(email);
+      throw new LoyaltyError("not_applied", "HTTP 423");
+    };
+    await getLoyaltyBalance(db, loyalty.gateway, EMAIL).catch(() => {});
+    loyalty.state.failNext = new LoyaltyError("rejected", "HTTP 423");
+    await runDueJobs(db, handlers);
+    expect(db.select().from(jobs).get()).toMatchObject({
+      hasError: true,
+      totalTried: 1,
+    });
+
+    // Once the program is active, the next read credits and acks it.
+    loyalty.gateway.getBalance = read;
+    resetLoyaltyState();
+    expect(
+      await getLoyaltyBalance(db, loyalty.gateway, EMAIL, {
+        approvalDelaysMs: [],
+      }),
+    ).toBe(WELCOME_POINTS);
+    expect(db.select().from(jobs).get()).toMatchObject({ hasError: false });
+    expect(db.select().from(jobs).get()?.completedAt).toBeInstanceOf(Date);
+    expect(db.select().from(loyaltyOperations).get()?.status).toBe("done");
+  });
+
+  test("finishes the welcome credit in the background when Voucherify is down", async () => {
+    const db = createTestDb();
+    const loyalty = fakeLoyalty();
+    newMember(db, loyalty);
+    loyalty.state.failNext = new LoyaltyError("not_applied", "HTTP 429");
+
+    expect(
+      await getLoyaltyBalance(db, loyalty.gateway, EMAIL, {
+        approvalDelaysMs: [],
+      }),
+    ).toBe(0);
+
+    await runDueJobs(db, {
+      "credit-welcome-points": createWelcomePointsHandler(
+        db,
+        () => loyalty.gateway,
+      ),
+    });
+    db.update(jobs).set({ completedAt: null }).run();
+    await runDueJobs(db, {
+      "credit-welcome-points": createWelcomePointsHandler(
+        db,
+        () => loyalty.gateway,
+      ),
+    });
+
+    expect(loyalty.state.balance).toBe(WELCOME_POINTS);
+    expect(
+      loyalty.state.adjustments.filter((adjustment) => adjustment.points > 0),
+    ).toHaveLength(2);
+    expect(db.select().from(loyaltyOperations).get()?.status).toBe("done");
+  });
+});
+
+describe("checkout compensation", () => {
+  test("retries a session expiry that failed in the request", async () => {
+    const db = createTestDb();
+    const stripe = fakeStripe();
+    let down = true;
+    const flaky: CheckoutGateway = {
+      ...stripe.gateway,
+      async expireCheckoutSession(sessionId) {
+        if (down) {
+          throw new Error("Stripe is down");
+        }
+
+        await stripe.gateway.expireCheckoutSession(sessionId);
+      },
+    };
+
+    await expireSessionNow(db, flaky, "cs_abandoned");
+    expect(jobIds(db)).toEqual([expireSessionJobId("cs_abandoned")]);
+
+    down = false;
+    await runDueJobs(db, {
+      "expire-checkout-session": createExpireSessionHandler(() => flaky),
+    });
+
+    expect(stripe.expired).toEqual(["cs_abandoned"]);
+    expect(db.select().from(jobs).get()?.completedAt).toBeInstanceOf(Date);
+  });
+});
+
 describe("loyalty endpoints", () => {
   const originalEnv = {
     appId: process.env.VOUCHERIFY_APP_ID,
     secretKey: process.env.VOUCHERIFY_SECRET_KEY,
-    campaignId: process.env.VOUCHERIFY_LOYALTY_CAMPAIGN_ID,
+    programId: process.env.VOUCHERIFY_LOYALTY_PROGRAM_ID,
   };
 
   beforeEach(() => {
     delete process.env.VOUCHERIFY_APP_ID;
     delete process.env.VOUCHERIFY_SECRET_KEY;
-    delete process.env.VOUCHERIFY_LOYALTY_CAMPAIGN_ID;
+    delete process.env.VOUCHERIFY_LOYALTY_PROGRAM_ID;
   });
 
   afterEach(() => {
@@ -675,7 +1095,7 @@ describe("loyalty endpoints", () => {
     for (const [key, value] of [
       ["VOUCHERIFY_APP_ID", originalEnv.appId],
       ["VOUCHERIFY_SECRET_KEY", originalEnv.secretKey],
-      ["VOUCHERIFY_LOYALTY_CAMPAIGN_ID", originalEnv.campaignId],
+      ["VOUCHERIFY_LOYALTY_PROGRAM_ID", originalEnv.programId],
     ] as const) {
       if (value === undefined) {
         delete process.env[key];

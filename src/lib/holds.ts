@@ -1,6 +1,7 @@
 import { and, eq, isNull, lte, ne } from "drizzle-orm";
 import type { Db } from "@/db/client";
 import { loyaltyOperations, payments, reservations } from "@/db/schema";
+import { enqueueExpireSession } from "./checkout-compensation";
 import {
   enqueueRestorePoints,
   releasePaymentPoints,
@@ -50,7 +51,8 @@ export function expireHold(tx: Db, reservationId: string, now = new Date()) {
 /**
  * A crash between the Voucherify debit and the payment insert leaves a spend
  * with no payment row. Record the attempt as failed (so the next checkout gets
- * a new idempotency key) and restore its points; its URL was never handed out.
+ * a new idempotency key), expire its Stripe session and restore its points;
+ * its URL was never handed out.
  */
 export function reconcileOrphanSpends(
   tx: Db,
@@ -87,11 +89,13 @@ export function reconcileOrphanSpends(
       continue;
     }
 
+    const sessionId = sessionIdFromSpendSourceId(operation.id);
+
     tx.insert(payments)
       .values({
         id: operation.paymentId,
         reservationId: reservation.id,
-        stripeCheckoutSessionId: sessionIdFromSpendSourceId(operation.id),
+        stripeCheckoutSessionId: sessionId,
         stripePaymentIntentId: null,
         checkoutUrl: null,
         amount: reservation.amount - operation.points,
@@ -103,6 +107,7 @@ export function reconcileOrphanSpends(
       })
       .onConflictDoNothing()
       .run();
+    enqueueExpireSession(tx, sessionId, now);
     enqueueRestorePoints(tx, operation.paymentId, now);
   }
 

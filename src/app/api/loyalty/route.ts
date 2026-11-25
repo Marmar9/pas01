@@ -1,3 +1,4 @@
+import { getDb } from "@/db/client";
 import { errorResponse } from "@/lib/api";
 import { getLoyaltyBalance } from "@/lib/loyalty";
 import { RATE_LIMITS, rateLimited } from "@/lib/rate-limit";
@@ -26,7 +27,7 @@ async function handler(request: Request) {
   }
 
   try {
-    const points = await getLoyaltyBalance(gateway, parsed.data);
+    const points = await getLoyaltyBalance(getDb(), gateway, parsed.data);
 
     return Response.json({ email: parsed.data, points });
   } catch (error) {

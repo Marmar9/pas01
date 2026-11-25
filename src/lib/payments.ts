@@ -38,7 +38,8 @@ export type ProcessStripeEventResult =
         | "reservation_expired"
         | "amount_mismatch"
         | "currency_mismatch"
-        | "code_generation_failed";
+        | "code_generation_failed"
+        | "payment_abandoned";
       permanent: boolean;
     };
 
@@ -136,10 +137,15 @@ function upsertPaidPayment(
   session: Stripe.Checkout.Session,
   reservation: ReservationRow,
   pointsUsed: number,
-): { id: string; reservationId: string; pointsUsed: number } {
+): {
+  id: string;
+  reservationId: string;
+  pointsUsed: number;
+  previousStatus: PaymentStatus | null;
+} {
   const now = new Date();
   const existing = tx
-    .select({ id: payments.id })
+    .select({ id: payments.id, status: payments.status })
     .from(payments)
     .where(eq(payments.stripeCheckoutSessionId, session.id))
     .get();
@@ -158,7 +164,12 @@ function upsertPaidPayment(
       .where(and(eq(payments.id, existing.id), ne(payments.status, "refunded")))
       .run();
 
-    return { id: existing.id, reservationId: reservation.id, pointsUsed };
+    return {
+      id: existing.id,
+      reservationId: reservation.id,
+      pointsUsed,
+      previousStatus: existing.status,
+    };
   }
 
   const id = crypto.randomUUID();
@@ -179,27 +190,12 @@ function upsertPaidPayment(
     })
     .run();
 
-  return { id, reservationId: reservation.id, pointsUsed };
-}
-
-function hasOtherPaidPayment(
-  tx: Db,
-  reservationId: string,
-  paymentId: string,
-): boolean {
-  return Boolean(
-    tx
-      .select({ id: payments.id })
-      .from(payments)
-      .where(
-        and(
-          eq(payments.reservationId, reservationId),
-          eq(payments.status, "paid"),
-          ne(payments.id, paymentId),
-        ),
-      )
-      .get(),
-  );
+  return {
+    id,
+    reservationId: reservation.id,
+    pointsUsed,
+    previousStatus: null,
+  };
 }
 
 function issueCodeForPaidReservation(
@@ -288,10 +284,16 @@ function applyPaidSession(
   if (reservation.status === "paid") {
     const payment = upsertPaidPayment(tx, session, reservation, pointsUsed);
 
-    // A second paid session for an already paid reservation is a double
-    // charge: keep the first ticket, refund this payment and restore its
-    // points. It earns no points.
-    if (hasOtherPaidPayment(tx, reservationId, payment.id)) {
+    // The ticket of a Stripe payment is issued in the same transaction that
+    // marks that payment paid, so a session that was not already paid did not
+    // buy this ticket (another session or the legacy purchase did). It is a
+    // double charge: keep the first ticket, refund this payment and restore
+    // its points. It earns no points. The same session reported twice
+    // (completed + async_payment_succeeded) is not a double charge.
+    if (
+      payment.previousStatus !== "paid" &&
+      payment.previousStatus !== "refunded"
+    ) {
       enqueueRefund(tx, payment.id);
       releasePaymentPoints(tx, payment);
     }
@@ -318,6 +320,23 @@ function applyPaidSession(
     releasePaymentPoints(tx, payment, now);
 
     return { ok: false, reason: "reservation_expired", permanent: true };
+  }
+
+  // The checkout saga already abandoned this attempt (its points debit failed
+  // or was rolled back and its session was queued for expiry), so it must not
+  // turn into a ticket. Refund it like a late payment.
+  const abandoned = tx
+    .select({ status: payments.status })
+    .from(payments)
+    .where(eq(payments.stripeCheckoutSessionId, session.id))
+    .get();
+
+  if (abandoned?.status === "failed" || abandoned?.status === "expired") {
+    const payment = upsertPaidPayment(tx, session, reservation, pointsUsed);
+    enqueueRefund(tx, payment.id);
+    releasePaymentPoints(tx, payment, now);
+
+    return { ok: false, reason: "payment_abandoned", permanent: true };
   }
 
   const code = issueCodeForPaidReservation(tx, reservationId, now);
